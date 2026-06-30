@@ -5,6 +5,7 @@ import { PluginActionError } from "./errors.js";
 
 const DAEMON_URL_SETTING = "daemonUrl";
 const TOKEN_SETTING = "daemonToken";
+const TOKEN_STORAGE_KEY = "remnoteconnect.daemonToken";
 
 const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {};
 const ENV_DAEMON_URL = env.VITE_REMNOTE_CONNECT_DAEMON_URL;
@@ -45,7 +46,9 @@ export class BridgeClient {
 
   private async connect(): Promise<void> {
     const url = (await this.plugin.settings.getSetting<string>(DAEMON_URL_SETTING)) || ENV_DAEMON_URL || DEFAULT_BRIDGE_URL;
-    const token = (await this.plugin.settings.getSetting<string>(TOKEN_SETTING)) || ENV_TOKEN || "";
+    const storage = window.localStorage as Storage | undefined;
+    const storedToken = typeof storage?.getItem === "function" ? storage.getItem(TOKEN_STORAGE_KEY) || "" : "";
+    const token = storedToken || (await this.plugin.settings.getSetting<string>(TOKEN_SETTING)) || ENV_TOKEN || "";
     if (!token) {
       await this.plugin.app.toast("RemNoteConnect token is missing. Paste the daemon token in plugin settings.");
       this.scheduleReconnect();

@@ -198,6 +198,7 @@ export class FakeRemGraph {
   readonly rems = new Map<string, FakeRem>();
   readonly cards = new Map<string, FakeCard>();
   readonly order = new Map<string, string[]>();
+  readonly settings = new Map<string, unknown>();
   readonly plugin: ReactRNPlugin;
   readonly root: FakeRem;
   cardMaterializeAfterReads = 0;
@@ -231,6 +232,12 @@ export class FakeRemGraph {
       card: {
         findOne: async (id?: string) => (id ? this.cards.get(id) ?? null : null),
         getAll: async () => [...this.cards.values()],
+      },
+      settings: {
+        setSetting: async (key: string, value: unknown) => {
+          this.settings.set(key, value);
+        },
+        getSetting: async (key: string) => this.settings.get(key),
       },
     } as unknown as ReactRNPlugin;
   }

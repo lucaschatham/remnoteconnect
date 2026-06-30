@@ -1,5 +1,7 @@
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { randomBytes } from "node:crypto";
+import { chmod, writeFile } from "node:fs/promises";
 import {
   ApiEnvelopeSchema,
   DAEMON_VERSION,
@@ -44,6 +46,11 @@ const MAX_MULTI_ACTIONS = 50;
 const MAGNITUDE_THRESHOLD = 50;
 const IRREVERSIBLE_SESSION_BUDGET = 3;
 const ENABLE_ACTION_LOGS = process.env.REMNOTE_CONNECT_LOG === "1";
+
+async function writeTokenFile(path: string, token: string): Promise<void> {
+  await writeFile(path, `${token}\n`, { mode: 0o600 });
+  await chmod(path, 0o600);
+}
 
 function responseFromError(error: unknown): ApiResponse<never> {
   const candidate = error as Partial<ApiError> | undefined;
@@ -167,6 +174,32 @@ async function dispatchAction(
       irreversibleRemaining: state.irreversibleRemaining,
       dryRunHashesRetained: state.dryRunHashes.size,
     });
+  }
+  if (action === "rotateToken") {
+    if (!bridge.status().connected) return fail("plugin_disconnected", "RemNote plugin must be connected before rotating the daemon token.");
+    try {
+      const nextToken = randomBytes(32).toString("hex");
+      await bridge.runJob("setDaemonToken", { token: nextToken }, 10_000);
+      await writeTokenFile(config.tokenFile, nextToken);
+      config.token = nextToken;
+      await appendAudit(config.logDir, {
+        ts: new Date().toISOString(),
+        action: "rotateToken",
+        targetIds: [],
+        count: 1,
+        status: "success",
+      });
+      return ok({ rotated: true, tokenFile: config.tokenFile, pluginUpdated: true });
+    } catch (error) {
+      await appendAudit(config.logDir, {
+        ts: new Date().toISOString(),
+        action: "rotateToken",
+        targetIds: [],
+        status: "error",
+        errorCode: (error as Partial<ApiError>)?.code,
+      }).catch(() => undefined);
+      return responseFromError(error);
+    }
   }
   if (action === "doctor") {
     const bridgeStatus = bridge.status();

@@ -14,6 +14,15 @@ async function createCard(graph: FakeRemGraph, front = "front", deckPath = "Deck
 }
 
 describe("plugin executor", () => {
+  it("stores a rotated daemon token without returning it", async () => {
+    const graph = new FakeRemGraph();
+    const result = (await executeAction(graph.plugin, "setDaemonToken", { token: "replacement-token-value" })) as { stored: boolean; token?: string };
+
+    expect(result).toEqual({ stored: true });
+    expect(result.token).toBeUndefined();
+    expect(graph.settings.get("daemonToken")).toBe("replacement-token-value");
+  });
+
   it("creates flashcards compactly by default and returns summaries when verbose", async () => {
     const graph = new FakeRemGraph();
     const compact = (await createCard(graph, "Question", "Alpha::Beta")) as { id: string; text?: string };

@@ -262,6 +262,53 @@ describe("daemon server", () => {
     await bundle.app.close();
   });
 
+  it("rotates the daemon token through the connected plugin without echoing the token", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    let storedToken = "";
+    const { ws, ready } = connectPlugin(port, {
+      onJob(message, socket) {
+        expect(message.action).toBe("setDaemonToken");
+        expect(typeof message.params.token).toBe("string");
+        storedToken = String(message.params.token);
+        socket.send(JSON.stringify({ type: "result", jobId: message.jobId, result: { stored: true }, error: null }));
+      },
+    });
+    await ready;
+
+    const rotated = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "rotateToken", version: 1 },
+    });
+    expect(rotated.statusCode).toBe(200);
+    expect(rotated.json().result).toMatchObject({ rotated: true, pluginUpdated: true });
+    expect(JSON.stringify(rotated.json())).not.toContain(storedToken);
+    expect(storedToken).toMatch(/^[0-9a-f]{64}$/);
+    expect(readFileSync(bundle.config.tokenFile, "utf8").trim()).toBe(storedToken);
+    expect(statSync(bundle.config.tokenFile).mode & 0o777).toBe(0o600);
+
+    const oldToken = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "version", version: 1 },
+    });
+    expect(oldToken.statusCode).toBe(401);
+
+    const newToken = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "127.0.0.1:8766", authorization: `Bearer ${storedToken}` },
+      payload: { action: "version", version: 1 },
+    });
+    expect(newToken.json()).toEqual({ result: 1, error: null });
+    ws.close();
+    await bundle.app.close();
+  });
+
   it("closes WebSocket connections with bad origin, bad token, or non-json hello", async () => {
     const bundle = testBundle();
     dirs.push(bundle.dir);

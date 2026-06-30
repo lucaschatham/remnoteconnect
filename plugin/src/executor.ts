@@ -28,6 +28,9 @@ function str(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+const DAEMON_TOKEN_SETTING = "daemonToken";
+const DAEMON_TOKEN_STORAGE_KEY = "remnoteconnect.daemonToken";
+
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
@@ -640,6 +643,19 @@ export async function executeAction(
   progress?: ProgressFn,
 ): Promise<unknown> {
   switch (action) {
+    case "setDaemonToken": {
+      const token = str(params.token);
+      if (!token || token.length < 16) throw new Error("setDaemonToken requires a token.");
+      const storage = globalThis.localStorage as Storage | undefined;
+      if (typeof storage?.setItem === "function") {
+        storage.setItem(DAEMON_TOKEN_STORAGE_KEY, token);
+      } else {
+        const settingsWithSetter = plugin.settings as unknown as { setSetting?: (key: string, value: string) => Promise<void> };
+        if (!settingsWithSetter.setSetting) throw new Error("No plugin-local token storage is available.");
+        await settingsWithSetter.setSetting(DAEMON_TOKEN_SETTING, token);
+      }
+      return { stored: true };
+    }
     case "scopeProbe": {
       const rems = await allAccessibleRems(plugin);
       const root = await getManagedRoot(plugin);
