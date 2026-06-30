@@ -1,0 +1,28 @@
+{
+  "name": "@remnoteconnect/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "remnote-connect-daemon": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "pnpm --filter @remnoteconnect/shared build && tsc -p tsconfig.json --noEmit",
+    "dev": "pnpm --filter @remnoteconnect/shared build && tsx src/index.ts",
+    "start": "node dist/index.js",
+    "token": "pnpm --filter @remnoteconnect/shared build && tsx src/cli.ts token",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@remnoteconnect/shared": "workspace:*",
+    "fastify": "^5.4.0",
+    "ws": "^8.18.3",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.3",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@remnoteconnect/plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.json --noEmit",
+    "typecheck": "pnpm --filter @remnoteconnect/shared build && tsc -p tsconfig.json --noEmit",
+    "dev": "pnpm --filter @remnoteconnect/shared build && vite --host 127.0.0.1 --port 8080",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@remnote/plugin-sdk": "0.0.46",
+    "@remnoteconnect/shared": "workspace:*",
+    "react": "^17.0.2",
+    "react-dom": "^17.0.2"
+  },
+  "devDependencies": {
+    "@types/react": "^17.0.88",
+    "@types/react-dom": "^17.0.26",
+    "@vitejs/plugin-react": "^4.6.0",
+    "vite": "^7.0.4",
+    "vitest": "^3.2.4"
+  }
+}

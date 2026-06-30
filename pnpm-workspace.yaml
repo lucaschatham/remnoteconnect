@@ -1,0 +1,6 @@
+packages:
+  - "shared"
+  - "daemon"
+  - "plugin"
+allowBuilds:
+  esbuild: true

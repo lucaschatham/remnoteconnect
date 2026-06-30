@@ -1,0 +1,26 @@
+{
+  "id": "remnoteconnect-codex-local-v3",
+  "name": "RemNoteConnect",
+  "author": "Lucas Chatham",
+  "description": "Private local bridge that lets terminal tools read, author, and safely operate on RemNote through reversible local controls.",
+  "repoUrl": "https://localhost.invalid/remnoteconnect",
+  "version": {
+    "major": 0,
+    "minor": 1,
+    "patch": 0
+  },
+  "manifestVersion": 1,
+  "requestNative": false,
+  "enableOnMobile": false,
+  "unlisted": true,
+  "requiredScopes": [
+    {
+      "type": "All",
+      "level": "ReadCreateModifyDelete"
+    },
+    {
+      "type": "KnowledgeBaseInfo",
+      "level": "Read"
+    }
+  ]
+}

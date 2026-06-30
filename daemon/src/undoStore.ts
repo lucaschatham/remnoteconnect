@@ -1,0 +1,57 @@
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+
+export type UndoRecord = {
+  schemaVersion: 1;
+  opId: string;
+  action: string;
+  createdAt: string;
+  targets: Array<Record<string, unknown>>;
+};
+
+export function undoDir(appDir: string): string {
+  return join(appDir, "undo");
+}
+
+export function undoPath(appDir: string, opId: string): string {
+  const root = resolve(undoDir(appDir));
+  const candidate = resolve(root, `${opId}.json`);
+  if (!candidate.startsWith(`${root}/`)) throw new Error("Invalid undo opId.");
+  return candidate;
+}
+
+export async function writeUndoRecord(appDir: string, record: UndoRecord): Promise<{ path: string; opId: string; targetCount: number }> {
+  if (record.schemaVersion !== 1 || !record.opId || !Array.isArray(record.targets)) {
+    throw new Error("Invalid undo record.");
+  }
+  await mkdir(undoDir(appDir), { recursive: true });
+  const path = undoPath(appDir, record.opId);
+  await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+  return { path, opId: record.opId, targetCount: record.targets.length };
+}
+
+export async function readUndoRecord(appDir: string, opId: string): Promise<UndoRecord> {
+  return JSON.parse(await readFile(undoPath(appDir, opId), "utf8")) as UndoRecord;
+}
+
+export async function listUndoRecords(appDir: string): Promise<Array<{ opId: string; path: string }>> {
+  try {
+    const files = await readdir(undoDir(appDir));
+    return files
+      .filter((file) => file.endsWith(".json"))
+      .map((file) => ({ opId: file.slice(0, -5), path: undoPath(appDir, file.slice(0, -5)) }));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+export async function clearUndoRecords(appDir: string, opId?: string): Promise<number> {
+  if (opId) {
+    await rm(undoPath(appDir, opId), { force: true });
+    return 1;
+  }
+  const records = await listUndoRecords(appDir);
+  for (const record of records) await rm(record.path, { force: true });
+  return records.length;
+}

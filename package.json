@@ -1,0 +1,38 @@
+{
+  "name": "remnote-connect",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Private local RemNote bridge with an AnkiConnect-inspired API.",
+  "type": "module",
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm --filter @remnoteconnect/daemon test",
+    "dev:daemon": "pnpm --filter @remnoteconnect/daemon dev",
+    "dev:plugin": "pnpm --filter @remnoteconnect/plugin dev",
+    "token": "pnpm --filter @remnoteconnect/daemon token",
+    "smoke": "node scripts/smoke.mjs",
+    "e2e": "node scripts/e2e.mjs",
+    "bench": "node scripts/bench.mjs",
+    "live:restore": "node scripts/live-restore.mjs",
+    "live:security": "node scripts/live-security.mjs",
+    "live:scope": "node scripts/live-scope.mjs",
+    "live:softdelete": "node scripts/live-softdelete.mjs",
+    "live:docs": "node scripts/live-docs.mjs",
+    "live:cleanup": "node scripts/live-cleanup.mjs",
+    "live:idempotent": "node scripts/live-idempotent.mjs",
+    "live:scheduler": "node scripts/scheduler-smoke.mjs",
+    "live:jobs": "node scripts/job-retention.mjs",
+    "chaos:daemon": "node scripts/chaos-daemon.mjs",
+    "chaos:async": "node scripts/chaos-async-job.mjs",
+    "launch-agent:install": "node scripts/install-launch-agent.mjs install",
+    "launch-agent:check": "node scripts/install-launch-agent.mjs check",
+    "launch-agent:uninstall": "node scripts/install-launch-agent.mjs uninstall",
+    "check:no-token": "node scripts/check-no-token.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "typescript": "^5.8.3"
+  }
+}

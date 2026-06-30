@@ -1,0 +1,266 @@
+import { randomUUID } from "node:crypto";
+import { WebSocket, WebSocketServer } from "ws";
+import {
+  fail,
+  type ApiError,
+  type ApiResponse,
+  type PluginHello,
+  PluginHelloSchema,
+  PluginResultSchema,
+} from "@remnoteconnect/shared";
+import type { DaemonConfig } from "./config.js";
+import { isAllowedOrigin, safeTokenEqual } from "./security.js";
+
+type PendingJob = {
+  jobId: string;
+  action: string;
+  params: Record<string, unknown>;
+  createdAt: number;
+  timeout: NodeJS.Timeout;
+  resolve: (value: unknown) => void;
+  reject: (error: ApiError) => void;
+  progress: Array<{ completed: number; total: number; message?: string; at: number }>;
+};
+
+type JobRecord = {
+  status: string;
+  action: string;
+  progress: PendingJob["progress"];
+  updatedAt: number;
+};
+
+export type BridgeStatus = {
+  connected: boolean;
+  connectedAt?: string;
+  pluginVersion?: string;
+  transport?: "websocket";
+  capabilities?: Record<string, unknown>;
+  pendingJobs: number;
+  activeConnections: number;
+  retainedJobs: number;
+};
+
+const MAX_JOB_HISTORY = 500;
+const JOB_HISTORY_TTL_MS = 30 * 60 * 1000;
+
+export class PluginBridge {
+  private ws?: WebSocket;
+  private hello?: PluginHello;
+  private connectedAt?: Date;
+  private pending = new Map<string, PendingJob>();
+  private jobs = new Map<string, JobRecord>();
+
+  constructor(private readonly config: DaemonConfig) {}
+
+  createWebSocketServer(): WebSocketServer {
+    const wss = new WebSocketServer({ noServer: true });
+    wss.on("connection", (ws, request) => {
+      const origin = request.headers.origin;
+      if (!isAllowedOrigin(origin, this.config)) {
+        ws.close(1008, "forbidden origin");
+        return;
+      }
+      this.attach(ws);
+    });
+    return wss;
+  }
+
+  status(): BridgeStatus {
+    return {
+      connected: this.ws?.readyState === WebSocket.OPEN && Boolean(this.hello),
+      connectedAt: this.connectedAt?.toISOString(),
+      pluginVersion: this.hello?.pluginVersion,
+      transport: this.hello?.transport,
+      capabilities: this.hello?.capabilities,
+      pendingJobs: this.pending.size,
+      activeConnections: this.ws?.readyState === WebSocket.OPEN && Boolean(this.hello) ? 1 : 0,
+      retainedJobs: this.jobs.size,
+    };
+  }
+
+  jobStatus(jobId: string): ApiResponse {
+    this.pruneJobs();
+    const job = this.jobs.get(jobId);
+    if (!job) return fail("not_found", `No job found for ${jobId}`);
+    return { result: job, error: null };
+  }
+
+  async runJob(action: string, params: Record<string, unknown>, timeoutMs = 30_000): Promise<unknown> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.hello) {
+      throw {
+        code: "plugin_disconnected",
+        message: "RemNote plugin is not connected to the local daemon.",
+      } satisfies ApiError;
+    }
+
+    const jobId = randomUUID();
+    const message = { type: "job", jobId, action, params };
+    const result = new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pending.delete(jobId);
+        this.setJob(jobId, {
+          status: "timeout",
+          action,
+          progress: this.jobs.get(jobId)?.progress ?? [],
+          updatedAt: Date.now(),
+        });
+        reject({ code: "timeout", message: `Timed out waiting for plugin job ${jobId}` });
+      }, timeoutMs);
+
+      const pendingJob: PendingJob = {
+        jobId,
+        action,
+        params,
+        createdAt: Date.now(),
+        timeout,
+        resolve,
+        reject,
+        progress: [],
+      };
+      this.pending.set(jobId, pendingJob);
+      this.setJob(jobId, { status: "pending", action, progress: pendingJob.progress, updatedAt: Date.now() });
+    });
+
+    this.ws.send(JSON.stringify(message));
+    return result;
+  }
+
+  private attach(ws: WebSocket): void {
+    let authenticated = false;
+
+    ws.on("message", (raw) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw.toString("utf8"));
+      } catch {
+        ws.close(1003, "invalid json");
+        return;
+      }
+
+      if (!authenticated) {
+        const hello = PluginHelloSchema.safeParse(parsed);
+        if (!hello.success || !safeTokenEqual(hello.data.token, this.config.token)) {
+          ws.close(1008, "unauthorized");
+          return;
+        }
+        this.replaceConnection(ws, hello.data);
+        authenticated = true;
+        ws.send(JSON.stringify({ type: "hello_ack", daemonVersion: "0.1.0" }));
+        return;
+      }
+
+      const result = PluginResultSchema.safeParse(parsed);
+      if (result.success) {
+        this.completeJob(result.data.jobId, result.data.result, result.data.error ?? null);
+        return;
+      }
+
+      const progress = parsed as {
+        type?: string;
+        jobId?: string;
+        completed?: number;
+        total?: number;
+        message?: string;
+      };
+      if (progress.type === "progress" && progress.jobId) {
+        const job = this.pending.get(progress.jobId);
+        if (!job) return;
+        job.progress.push({
+          completed: Number(progress.completed ?? 0),
+          total: Number(progress.total ?? 0),
+          message: progress.message,
+          at: Date.now(),
+        });
+        return;
+      }
+    });
+
+    ws.on("close", () => {
+      if (this.ws === ws) {
+        this.ws = undefined;
+        this.hello = undefined;
+        this.connectedAt = undefined;
+      }
+    });
+  }
+
+  private replaceConnection(ws: WebSocket, hello: PluginHello): void {
+    if (this.ws && this.ws !== ws) {
+      this.rejectPending("plugin_reconnected", "RemNote plugin reconnected; in-flight jobs were cancelled.");
+      this.ws.close(1012, "replaced by a new plugin connection");
+    }
+    this.ws = ws;
+    this.hello = hello;
+    this.connectedAt = new Date();
+  }
+
+  private completeJob(jobId: string, result: unknown, error: { code: string; message: string; details?: unknown } | null): void {
+    const job = this.pending.get(jobId);
+    if (!job) return;
+    clearTimeout(job.timeout);
+    this.pending.delete(jobId);
+    if (error) {
+      this.setJob(jobId, { status: "error", action: job.action, progress: job.progress, updatedAt: Date.now() });
+      job.reject({
+        code: this.publicErrorCode(error.code),
+        message: error.message,
+        details: error.details,
+      });
+    } else {
+      this.setJob(jobId, { status: "complete", action: job.action, progress: job.progress, updatedAt: Date.now() });
+      job.resolve(result);
+    }
+  }
+
+  private publicErrorCode(code: string): ApiError["code"] {
+    if (
+      code === "bad_request" ||
+      code === "unauthorized" ||
+      code === "forbidden_origin" ||
+      code === "plugin_disconnected" ||
+      code === "plugin_reconnected" ||
+      code === "timeout" ||
+      code === "unsupported" ||
+      code === "not_implemented" ||
+      code === "not_found" ||
+      code === "confirm_required" ||
+      code === "dry_run_required" ||
+      code === "dry_run_mismatch" ||
+      code === "magnitude_guard" ||
+      code === "irreversible_budget_exceeded" ||
+      code === "forbidden_target" ||
+      code === "backup_failed" ||
+      code === "plugin_error" ||
+      code === "internal_error"
+    ) {
+      return code;
+    }
+    return "plugin_error";
+  }
+
+  private rejectPending(code: ApiError["code"], message: string): void {
+    for (const [jobId, job] of this.pending) {
+      clearTimeout(job.timeout);
+      this.pending.delete(jobId);
+      this.setJob(jobId, { status: "error", action: job.action, progress: job.progress, updatedAt: Date.now() });
+      job.reject({ code, message });
+    }
+  }
+
+  private setJob(jobId: string, record: JobRecord): void {
+    this.jobs.set(jobId, record);
+    this.pruneJobs();
+  }
+
+  private pruneJobs(): void {
+    const cutoff = Date.now() - JOB_HISTORY_TTL_MS;
+    for (const [jobId, job] of this.jobs) {
+      if (job.status !== "pending" && job.updatedAt < cutoff) this.jobs.delete(jobId);
+    }
+    while (this.jobs.size > MAX_JOB_HISTORY) {
+      const oldestDone = [...this.jobs.entries()].find(([, job]) => job.status !== "pending");
+      if (!oldestDone) return;
+      this.jobs.delete(oldestDone[0]);
+    }
+  }
+}
