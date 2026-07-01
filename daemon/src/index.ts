@@ -2,8 +2,10 @@
 import { loadConfig } from "./config.js";
 import { buildServer } from "./server.js";
 import { startPluginStaticServer } from "./pluginStatic.js";
+import { compactDurableJobs } from "./jobStore.js";
 
 const config = loadConfig();
+await compactDurableJobs(config.appDir);
 const { app } = buildServer(config);
 
 try {

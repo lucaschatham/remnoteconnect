@@ -9,6 +9,7 @@ import {
   findFlashcardRems,
   findGraphRems,
   getManagedRoot,
+  mapBounded,
   managedRems,
   requireAccessibleRem,
   requireManagedRem,
@@ -18,6 +19,7 @@ import {
   summarizeCard,
   summarizeRem,
   toRichText,
+  yieldToEventLoop,
 } from "./remnoteHelpers.js";
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -211,16 +213,28 @@ async function trashFolder(plugin: ReactRNPlugin, opId?: string): Promise<RemObj
 
 const TRASH_METADATA_CHILD_TEXT = new Set(["Bullet Icon", "Is Folder", "Status"]);
 
-async function trashChildInfo(plugin: ReactRNPlugin, rem: RemObject): Promise<{ rem: RemObject; text: string; childCount: number }> {
+async function trashChildInfo(plugin: ReactRNPlugin, rem: RemObject): Promise<{ rem: RemObject; text: string; childCount: number; visibleChildCount: number }> {
+  const children = await rem.getChildrenRem();
+  const childInfos = await Promise.all(
+    children.map(async (child) => ({
+      text: await richTextToString(plugin, child.text),
+      childCount: (await child.getChildrenRem()).length,
+    })),
+  );
   return {
     rem,
     text: await richTextToString(plugin, rem.text),
-    childCount: (await rem.getChildrenRem()).length,
+    childCount: children.length,
+    visibleChildCount: childInfos.filter((info) => !isTrashMetadataChild(info)).length,
   };
 }
 
 function isTrashMetadataChild(info: { text: string; childCount: number }): boolean {
-  return info.childCount === 0 && TRASH_METADATA_CHILD_TEXT.has(info.text);
+  return info.childCount === 0 && (TRASH_METADATA_CHILD_TEXT.has(info.text) || /^\[\[[A-Za-z0-9]{17}\]\]$/.test(info.text));
+}
+
+function isEmptyTrashMetadataContainer(info: { childCount: number; visibleChildCount: number }): boolean {
+  return info.childCount > 0 && info.visibleChildCount === 0;
 }
 
 async function softDeleteRems(plugin: ReactRNPlugin, action: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -577,38 +591,159 @@ export function ankiNoteToFlashcard(note: Record<string, unknown>): CreateFlashc
   };
 }
 
+function stripHtml(html: string | undefined): string {
+  if (!html) return "";
+  return html
+    .replace(/\[sound:[^\]]+\]/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|tr|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n\s+/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
+
+async function addHtmlFieldChild(plugin: ReactRNPlugin, parent: RemObject, label: string, html: string, existing?: RemObject): Promise<RemObject | undefined> {
+  if (!html.trim()) return undefined;
+  const child = existing ?? (await plugin.rem.createRem());
+  if (!child) throw new Error("RemNote did not return a Rem from createRem.");
+  await child.setParent(parent);
+  await child.setText(await toRichText(plugin, label));
+  if (existing) {
+    await child.setBackText(await toRichText(plugin, stripHtml(html)));
+    return child;
+  }
+  try {
+    await plugin.richText.parseAndInsertHtml(html, child);
+  } catch {
+    await child.setBackText(await toRichText(plugin, stripHtml(html)));
+  }
+  return child;
+}
+
+function clozeSpanRecords(value: unknown): Array<{ start: number; end: number; group?: number; hint?: string }> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(asRecord)
+    .map((record) => ({
+      start: Number(record.start),
+      end: Number(record.end),
+      group: typeof record.group === "number" ? record.group : undefined,
+      hint: str(record.hint),
+    }))
+    .filter((span) => Number.isFinite(span.start) && Number.isFinite(span.end) && span.end > span.start);
+}
+
+async function clozeRichText(plugin: ReactRNPlugin, text: string, spans: Array<{ start: number; end: number }>): Promise<RichTextInterface> {
+  let richText = await toRichText(plugin, text);
+  for (const span of spans) {
+    richText = await plugin.richText.applyTextFormatToRange(richText, span.start, span.end, "cloze");
+  }
+  return richText;
+}
+
+async function addExtraFields(plugin: ReactRNPlugin, rem: RemObject, fields: unknown, reusableChildren: RemObject[] = []): Promise<number> {
+  const entries = Array.isArray(fields) ? fields.map(asRecord) : [];
+  let count = 0;
+  for (const field of entries) {
+    const name = str(field.name) ?? "Field";
+    const html = str(field.html);
+    const value = str(field.value) ?? stripHtml(html);
+    const existing = reusableChildren[count];
+    if (html) {
+      await addHtmlFieldChild(plugin, rem, name, html, existing);
+      count += 1;
+    } else if (value) {
+      const child = existing ?? (await plugin.rem.createRem());
+      if (!child) throw new Error("RemNote did not return a Rem from createRem.");
+      await child.setParent(rem);
+      await child.setText(await toRichText(plugin, name));
+      await child.setBackText(await toRichText(plugin, value));
+      count += 1;
+    }
+  }
+  return count;
+}
+
+async function removeRemTree(rem: RemObject): Promise<void> {
+  for (const child of await rem.getChildrenRem()) await removeRemTree(child);
+  await rem.remove();
+}
+
 async function createFlashcard(
   plugin: ReactRNPlugin,
   params: Record<string, unknown>,
   options: { defaultMaterializeTimeoutMs?: number } = {},
 ): Promise<Record<string, unknown>> {
   const deckPath = str(params.deckPath) ?? str(params.deckName);
+  const frontHtml = str(params.frontHtml);
+  const backHtml = str(params.backHtml);
+  const clozeText = str(params.clozeText);
+  const clozeSpans = clozeSpanRecords(params.clozeSpans);
   if (params.dryRun === true) {
     return {
       dryRun: true,
       wouldCreate: "flashcard",
       deckPath: deckPath ?? "",
-      front: params.front,
-      back: params.back,
+      front: params.front ?? stripHtml(frontHtml),
+      back: params.back ?? stripHtml(backHtml),
+      cloze: Boolean(clozeText && clozeSpans.length > 0),
       tags: stringArray(params.tags),
       externalId: str(params.externalId),
       batchId: str(params.batchId),
     };
   }
-  const parent = await ensurePath(plugin, deckPath, MANAGED_ROOT_NAME, { finalAsFolder: true });
+  const plainDeckPath = params.plainDeckPath === true;
+  const parent = await ensurePath(plugin, deckPath, MANAGED_ROOT_NAME, {
+    finalAsDocument: params.deckAsDocument === true,
+    finalAsFolder: !plainDeckPath && params.deckAsDocument !== true,
+    plain: plainDeckPath,
+  });
   const existingRemId = str(params.existingRemId);
   const existing = existingRemId ? await plugin.rem.findOne(existingRemId) : undefined;
   const rem = existing ?? (await plugin.rem.createRem());
   if (!rem) throw new Error("RemNote did not return a Rem from createRem.");
+  const reusableChildren = existing && params.replaceChildrenOnUpdate === true ? await existing.getChildrenRem() : [];
   await rem.setParent(parent);
-  await rem.setText(await toRichText(plugin, params.front as string | unknown[]));
-  await rem.setBackText(await toRichText(plugin, params.back as string | unknown[]));
+  if (clozeText && clozeSpans.length > 0) {
+    await rem.setText(await clozeRichText(plugin, clozeText, clozeSpans));
+    await rem.setBackText(await toRichText(plugin, str(params.back) ?? ""));
+  } else {
+    await rem.setText(await toRichText(plugin, (params.front as string | unknown[]) ?? stripHtml(frontHtml)));
+    await rem.setBackText(await toRichText(plugin, (params.back as string | unknown[]) ?? stripHtml(backHtml)));
+  }
   await rem.setEnablePractice(true);
   await rem.setPracticeDirection((str(params.practiceDirection) as "forward" | "backward" | "none" | "both" | undefined) ?? "forward");
   await addTags(plugin, rem, stringArray(params.tags));
+  let extraFieldCount = 0;
+  let reusableIndex = 0;
+  if (frontHtml) {
+    await addHtmlFieldChild(plugin, rem, "Anki Front HTML", frontHtml, reusableChildren[reusableIndex]);
+    reusableIndex += 1;
+    extraFieldCount += 1;
+  }
+  if (backHtml) {
+    await addHtmlFieldChild(plugin, rem, "Anki Back HTML", backHtml, reusableChildren[reusableIndex]);
+    reusableIndex += 1;
+    extraFieldCount += 1;
+  }
+  const extraFieldsAdded = await addExtraFields(plugin, rem, params.extraFields, reusableChildren.slice(reusableIndex));
+  reusableIndex += extraFieldsAdded;
+  extraFieldCount += extraFieldsAdded;
+  for (const staleChild of reusableChildren.slice(reusableIndex)) {
+    await staleChild.setText(await toRichText(plugin, "Superseded imported field"));
+    await staleChild.setBackText(await toRichText(plugin, ""));
+  }
   await waitForCards(rem, Number(params.materializeTimeoutMs ?? options.defaultMaterializeTimeoutMs ?? 3500));
   if (params.verbose === true) return summarizeRem(plugin, rem);
-  return { id: rem._id, externalId: str(params.externalId), batchId: str(params.batchId) };
+  return { id: rem._id, externalId: str(params.externalId), batchId: str(params.batchId), extraFieldCount };
 }
 
 async function createFlashcards(plugin: ReactRNPlugin, params: Record<string, unknown>, progress?: ProgressFn): Promise<Record<string, unknown>> {
@@ -635,6 +770,170 @@ async function createFlashcards(plugin: ReactRNPlugin, params: Record<string, un
 }
 
 type ProgressFn = (completed: number, total: number, message?: string) => void;
+
+function publicError(error: unknown): Record<string, unknown> {
+  return {
+    message: error instanceof Error ? error.message : String(error),
+  };
+}
+
+function isClozeCardType(type: unknown): boolean {
+  return type !== "forward" && type !== "backward";
+}
+
+async function createProbeRem(plugin: ReactRNPlugin, parent: RemObject, text: string): Promise<RemObject> {
+  const rem = await plugin.rem.createRem();
+  if (!rem) throw new Error("RemNote did not return a Rem from createRem.");
+  await rem.setParent(parent);
+  await rem.setText(await toRichText(plugin, text));
+  return rem;
+}
+
+async function richTextProbeRead(plugin: ReactRNPlugin, rem: RemObject): Promise<Record<string, unknown>> {
+  const descendants = await rem.getDescendants();
+  const rems = [rem, ...descendants];
+  return {
+    descendantCount: descendants.length,
+    rems: await Promise.all(
+      rems.map(async (item) => ({
+        id: item._id,
+        text: await richTextToString(plugin, item.text),
+        html: item.text ? await plugin.richText.toHTML(item.text).catch((error: unknown) => `toHTML error: ${publicError(error).message}`) : "",
+        markdown: item.text ? await plugin.richText.toMarkdown(item.text).catch((error: unknown) => `toMarkdown error: ${publicError(error).message}`) : "",
+      })),
+    ),
+  };
+}
+
+async function runAnkiMigrationProbes(plugin: ReactRNPlugin, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const runId = str(params.runId) ?? `__codex_anki_probe__-${Date.now().toString(36)}`;
+  if (params.dryRun === true || params.confirm !== true) {
+    return {
+      dryRun: true,
+      runId,
+      probes: ["cloze materialization", "parseAndInsertHtml", "media rich text serialization", "deck leaf as document"],
+      warning: "ankiMigrationProbes creates disposable __codex_ Rems and tombstones them. Pass confirm:true to execute.",
+    };
+  }
+
+  const parent = await ensurePath(plugin, runId, MANAGED_ROOT_NAME, { finalAsFolder: true });
+  const probes: Record<string, unknown> = {};
+  let ok = true;
+
+  try {
+    const single = await createProbeRem(plugin, parent, "alpha beta gamma");
+    let singleText = await toRichText(plugin, "alpha beta gamma");
+    singleText = await plugin.richText.applyTextFormatToRange(singleText, 6, 10, "cloze");
+    await single.setText(singleText);
+    await single.setEnablePractice(true);
+    await waitForCards(single, 5000);
+    const singleCards = await Promise.all((await single.getCards()).map(summarizeCard));
+
+    const multi = await createProbeRem(plugin, parent, "one two three four");
+    let multiText = await toRichText(plugin, "one two three four");
+    multiText = await plugin.richText.applyTextFormatToRange(multiText, 0, 3, "cloze");
+    multiText = await plugin.richText.applyTextFormatToRange(multiText, 8, 13, "cloze");
+    await multi.setText(multiText);
+    await multi.setEnablePractice(true);
+    await waitForCards(multi, 5000);
+    const multiCards = await Promise.all((await multi.getCards()).map(summarizeCard));
+
+    probes.cloze = {
+      ok: singleCards.some((card) => isClozeCardType(card.type)),
+      singleCardTypes: singleCards.map((card) => card.type),
+      singleClozeCount: singleCards.filter((card) => isClozeCardType(card.type)).length,
+      multiCardTypes: multiCards.map((card) => card.type),
+      multiClozeCount: multiCards.filter((card) => isClozeCardType(card.type)).length,
+      groupingObservation:
+        multiCards.filter((card) => isClozeCardType(card.type)).length >= 2
+          ? "multiple cloze spans materialized as multiple cards"
+          : "multiple cloze spans did not materialize as separate cards in this probe",
+    };
+    ok = ok && (probes.cloze as { ok: boolean }).ok;
+  } catch (error) {
+    probes.cloze = { ok: false, error: publicError(error) };
+    ok = false;
+  }
+
+  try {
+    const htmlRem = await createProbeRem(plugin, parent, "HTML fidelity probe");
+    const html =
+      '<b>bold</b><ul><li>one</li><li>two</li></ul><img src="x.jpg"><anki-mathjax>\\\\frac{1}{2}</anki-mathjax>\\\\(x^2\\\\)[sound:a.mp3]';
+    await plugin.richText.parseAndInsertHtml(html, htmlRem);
+    probes.html = {
+      ok: true,
+      input: html,
+      readback: await richTextProbeRead(plugin, htmlRem),
+    };
+  } catch (error) {
+    probes.html = { ok: false, error: publicError(error) };
+    ok = false;
+  }
+
+  try {
+    const dataUri =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    const daemonUrl = str(params.mediaUrl) ?? "http://127.0.0.1:8766/media/probe-image.png";
+    const dataRem = await createProbeRem(plugin, parent, "data uri image");
+    const dataRichText = await plugin.richText.image(dataUri).value();
+    await dataRem.setText(dataRichText);
+    const daemonRem = await createProbeRem(plugin, parent, "daemon url image");
+    const daemonRichText = await plugin.richText.image(daemonUrl).value();
+    await daemonRem.setText(daemonRichText);
+    probes.media = {
+      ok: true,
+      dataUri: {
+        html: await plugin.richText.toHTML(dataRichText),
+        urls: await plugin.richText.findAllExternalURLs(dataRichText),
+      },
+      daemonUrl: {
+        url: daemonUrl,
+        html: await plugin.richText.toHTML(daemonRichText),
+        urls: await plugin.richText.findAllExternalURLs(daemonRichText),
+      },
+      caveat: "SDK probe verifies rich-text serialization and URL retention, not visual rendering in every RemNote surface.",
+    };
+  } catch (error) {
+    probes.media = { ok: false, error: publicError(error) };
+    ok = false;
+  }
+
+  try {
+    const deckDocument = await ensurePath(plugin, `${runId}::Leaf Deck`, MANAGED_ROOT_NAME, { finalAsDocument: true });
+    const card = await createProbeRem(plugin, deckDocument, "Deck document card?");
+    await card.setBackText(await toRichText(plugin, "Yes."));
+    await card.setEnablePractice(true);
+    await card.setPracticeDirection("forward");
+    await waitForCards(card, 5000);
+    probes.deckAsDocument = {
+      ok: (await deckDocument.isDocument()) && (await card.getCards()).length > 0,
+      documentId: deckDocument._id,
+      isDocument: await deckDocument.isDocument(),
+      cardCount: (await card.getCards()).length,
+    };
+    ok = ok && (probes.deckAsDocument as { ok: boolean }).ok;
+  } catch (error) {
+    probes.deckAsDocument = { ok: false, error: publicError(error) };
+    ok = false;
+  }
+
+  const opId = `${runId}-tombstone`;
+  const undoRecord = await captureUndoRecord("ankiMigrationProbes", opId, [parent]);
+  const trash = await trashFolder(plugin, opId);
+  await parent.setParent(trash);
+
+  return {
+    ok,
+    runId,
+    probes,
+    cleanup: {
+      mode: "soft-delete",
+      opId,
+      tombstoneParentId: trash._id,
+    },
+    undoRecord,
+  };
+}
 
 export async function executeAction(
   plugin: ReactRNPlugin,
@@ -691,6 +990,8 @@ export async function executeAction(
         },
       };
     }
+    case "ankiMigrationProbes":
+      return runAnkiMigrationProbes(plugin, params);
     case "listRoots": {
       const root = await getManagedRoot(plugin);
       return params.verbose === true ? summarizeRem(plugin, root, root) : compactRem(root);
@@ -859,7 +1160,8 @@ export async function executeAction(
     case "importSnapshot": {
       const snapshot = asRecord(params.snapshot) as { nodes?: unknown[] };
       if (!Array.isArray(snapshot.nodes)) throw new Error("importSnapshot requires snapshot.nodes.");
-      if (params.dryRun === true) return { dryRun: true, wouldImport: snapshot.nodes.length };
+      const count = snapshotNodeCount(snapshot.nodes);
+      if (params.dryRun === true) return { dryRun: true, wouldImport: count, count };
       const parent = await ensurePath(plugin, str(params.parentPath), MANAGED_ROOT_NAME, { finalAsFolder: true });
       const restored: string[] = [];
       for (const node of snapshot.nodes) {
@@ -952,8 +1254,16 @@ export async function executeAction(
       const tombstones = await Promise.all(
         (await trash.getChildrenRem()).map((rem) => trashChildInfo(plugin, rem)),
       );
-      const visible = tombstones.filter((info) => !isTrashMetadataChild(info));
-      return { count: visible.length, tombstones: visible.map((info) => ({ id: info.rem._id, text: info.text, childCount: info.childCount })) };
+      const visible = tombstones.filter((info) => !isTrashMetadataChild(info) && !isEmptyTrashMetadataContainer(info));
+      return {
+        count: visible.length,
+        tombstones: visible.map((info) => ({
+          id: info.rem._id,
+          text: info.text,
+          childCount: info.childCount,
+          visibleChildCount: info.visibleChildCount,
+        })),
+      };
     }
     case "restoreTombstone": {
       if (params.undoRecord) return executeAction(plugin, "undo", params, progress);
@@ -968,6 +1278,7 @@ export async function executeAction(
       const trashChildren = await Promise.all((await trash.getChildrenRem()).map((rem) => trashChildInfo(plugin, rem)));
       const targets: RemObject[] = [];
       for (const info of trashChildren) {
+        if (isEmptyTrashMetadataContainer(info)) continue;
         if (opId ? info.text === opId : !isTrashMetadataChild(info)) targets.push(info.rem);
       }
       const remIds = targets.map((rem) => rem._id);
@@ -981,7 +1292,7 @@ export async function executeAction(
         };
       }
       if (params.irreversibleVerified !== true) throw new Error("emptyTrash requires daemon irreversible verification.");
-      for (const rem of targets) await rem.remove();
+      for (const rem of targets) await removeRemTree(rem);
       return { opId, count: targets.length, remIds };
     }
     case "createDocument": {
@@ -1038,12 +1349,22 @@ export async function executeAction(
       const by = str(params.by) ?? "text";
       if (by !== "text") throw new Error("findDuplicates currently supports by:\"text\" only.");
       const groups = new Map<string, RemObject[]>();
-      for (const rem of await allAccessibleRems(plugin)) {
-        const text = (await richTextToString(plugin, rem.text)).trim().replace(/\s+/g, " ").toLowerCase();
-        if (!text) continue;
-        const existing = groups.get(text) ?? [];
-        existing.push(rem);
-        groups.set(text, existing);
+      const allRems = await allAccessibleRems(plugin);
+      const chunkSize = Math.max(1, Number(params.chunkSize ?? 500));
+      for (let offset = 0; offset < allRems.length; offset += chunkSize) {
+        const chunk = allRems.slice(offset, offset + chunkSize);
+        const entries = await mapBounded(chunk, 32, async (rem) => {
+          const text = (await richTextToString(plugin, rem.text)).trim().replace(/\s+/g, " ").toLowerCase();
+          return text ? { text, rem } : undefined;
+        });
+        for (const entry of entries) {
+          if (!entry) continue;
+          const existing = groups.get(entry.text) ?? [];
+          existing.push(entry.rem);
+          groups.set(entry.text, existing);
+        }
+        progress?.(Math.min(offset + chunk.length, allRems.length), allRems.length, `Scanned ${Math.min(offset + chunk.length, allRems.length)}/${allRems.length}`);
+        await yieldToEventLoop();
       }
       const duplicates = [];
       for (const [text, rems] of groups.entries()) {
@@ -1090,7 +1411,20 @@ export function capabilityMatrix(): Record<string, unknown> {
         "remove",
       ],
       card: ["findOne", "getAll", "remove", "updateCardRepetitionStatus"],
-      richText: ["text", "toString", "parseFromMarkdown", "toMarkdown", "latex", "image", "code", "rem"],
+      richText: [
+        "text",
+        "toString",
+        "toHTML",
+        "parseAndInsertHtml",
+        "applyTextFormatToRange",
+        "parseFromMarkdown",
+        "toMarkdown",
+        "latex",
+        "image",
+        "audio",
+        "code",
+        "rem",
+      ],
     },
     sdkLimitations: {
       nativeTrashRestore: "not found in @remnote/plugin-sdk@0.0.46 declarations",
@@ -1100,5 +1434,12 @@ export function capabilityMatrix(): Record<string, unknown> {
     queryGrammar: ["deck:<path>", "tag:<tag>", "text:<text>", "id:<remId>"],
     operationalRoot: MANAGED_ROOT_NAME,
     safetyModel: "whole-kb with tombstone + daemon undo store",
+    migrationFeatures: {
+      parseAndInsertHtml: true,
+      clozeWrite: true,
+      mediaPipeline: "daemon-local-url",
+      noteTypeMapping: "scripts/anki-migrate.mjs",
+      finalAsDocument: true,
+    },
   };
 }

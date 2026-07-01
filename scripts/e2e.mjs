@@ -2,6 +2,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { hardDeleteTestIds } from "./live-helpers.mjs";
 
 const tokenPath =
   process.env.REMNOTE_CONNECT_TOKEN_FILE ??
@@ -40,14 +41,6 @@ async function pollBridgeConnected() {
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   throw new Error(`RemNote plugin bridge is not connected after 20s. Last status: ${JSON.stringify(lastStatus?.bridge ?? null)}`);
-}
-
-async function hardDeleteTestIds(ids, opId) {
-  const uniqueIds = [...new Set(ids.filter(Boolean))];
-  if (uniqueIds.length === 0) return;
-  await call("deleteRem", { remIds: uniqueIds, confirm: true, confirmCount: uniqueIds.length, opId });
-  const dryRun = await call("emptyTrash", { opId });
-  if (dryRun.count > 0) await call("emptyTrash", { opId, confirm: true, fromDryRun: dryRun.fromDryRun, confirmCount: dryRun.count });
 }
 
 async function cleanup() {

@@ -69,6 +69,32 @@ describe("plugin executor", () => {
     expect(waited.created[0].cards).toHaveLength(1);
   });
 
+  it("can replace imported child fields on idempotent flashcard updates", async () => {
+    const graph = new FakeRemGraph();
+    const first = (await executeAction(graph.plugin, "createFlashcard", {
+      deckPath: "Anki Import::Deck",
+      front: "Question",
+      back: "Answer",
+      extraFields: [{ name: "Extra", value: "old" }],
+      materializeTimeoutMs: 0,
+    })) as { id: string };
+    const rem = graph.rems.get(first.id);
+    expect((await rem?.getChildrenRem())?.map((child) => child.backText)).toEqual(["old"]);
+
+    await executeAction(graph.plugin, "createFlashcard", {
+      existingRemId: first.id,
+      deckPath: "Anki Import::Deck",
+      front: "Question",
+      back: "Answer",
+      extraFields: [{ name: "Extra", value: "new" }],
+      replaceChildrenOnUpdate: true,
+      materializeTimeoutMs: 0,
+    });
+
+    const children = await rem?.getChildrenRem();
+    expect(children?.map((child) => child.backText)).toEqual(["new"]);
+  });
+
   it("searches the whole graph by deck, tag, text, id, and AND-composed terms", async () => {
     const graph = new FakeRemGraph();
     const alpha = await createCard(graph, "Alpha prompt", "Deck A");
@@ -325,6 +351,7 @@ describe("plugin executor", () => {
     const duplicates = (await executeAction(graph.plugin, "findDuplicates", {})) as { count: number };
     expect(duplicates.count).toBeGreaterThan(0);
 
+    const docChildId = (await graph.rems.get(createdDoc.id)?.getChildrenRem())?.[0]?._id;
     const deleted = (await executeAction(graph.plugin, "deleteRem", { id: createdDoc.id, confirm: true, opId: "op-doc" })) as { opId: string };
     expect(deleted.opId).toBe("op-doc");
     const tombstones = (await executeAction(graph.plugin, "listTombstones", {})) as { count: number };
@@ -332,6 +359,28 @@ describe("plugin executor", () => {
     const emptyDryRun = (await executeAction(graph.plugin, "emptyTrash", {})) as { dryRun: boolean; count: number };
     expect(emptyDryRun.dryRun).toBe(true);
     expect(emptyDryRun.count).toBe(1);
+    const emptied = (await executeAction(graph.plugin, "emptyTrash", { confirm: true, irreversibleVerified: true })) as { count: number };
+    expect(emptied.count).toBe(1);
+    expect((await executeAction(graph.plugin, "listTombstones", {})) as { count: number }).toMatchObject({ count: 0 });
+    expect(graph.rems.has(createdDoc.id)).toBe(false);
+    if (docChildId) expect(graph.rems.has(docChildId)).toBe(false);
+  });
+
+  it("ignores RemNote-generated reference-only trash metadata", async () => {
+    const graph = new FakeRemGraph();
+    const trash = await graph.createChild(graph.root, "Trash");
+    await graph.createChild(trash, "[[W7W0owfbKSKfoP9cf]]");
+    const emptyTombstoneContainer = await graph.createChild(trash, "3bb609ab-44b4-4491-b0ce-716558a4e796");
+    await graph.createChild(emptyTombstoneContainer, "[[W7W0owfbKSKfoP9cf]]");
+    await graph.createChild(emptyTombstoneContainer, "[[3PxmHFDpEohbWoMkS]]");
+    await graph.createChild(emptyTombstoneContainer, "[[FQM0VPOFpT74PC02Q]]");
+
+    const tombstones = (await executeAction(graph.plugin, "listTombstones", {})) as { count: number };
+    expect(tombstones.count).toBe(0);
+
+    const emptyDryRun = (await executeAction(graph.plugin, "emptyTrash", {})) as { dryRun: boolean; count: number };
+    expect(emptyDryRun.dryRun).toBe(true);
+    expect(emptyDryRun.count).toBe(0);
   });
 
   it("supports cleanup actions with dry-run defaults and undo records", async () => {

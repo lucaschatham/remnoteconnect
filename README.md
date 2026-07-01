@@ -37,7 +37,7 @@ This is workflow parity with AnkiConnect, not literal Anki compatibility. Anki-o
 4. Print the token:
 
    ```sh
-   npx pnpm@11.7.0 token
+   npx pnpm@11.7.0 token:unsafe
    ```
 
 5. In RemNote desktop, load the local plugin from:
@@ -63,7 +63,7 @@ This is workflow parity with AnkiConnect, not literal Anki compatibility. Anki-o
 ## Example Calls
 
 ```sh
-TOKEN="$(npx pnpm@11.7.0 --silent token)"
+TOKEN="$(npx pnpm@11.7.0 --silent token:unsafe)"
 curl -sS http://127.0.0.1:8766 \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -223,3 +223,9 @@ npx pnpm@11.7.0 chaos:async
 - Token file: `~/Library/Application Support/RemNoteConnect/token`
 - Backups: `~/Documents/RemNoteConnect/Backups`
 - If a plugin causes trouble, open RemNote with plugin disabling according to RemNote’s documented recovery flow.
+
+## RemNote Dark Mode
+
+RemNoteConnect does not install global CSS, mutate RemNote theme state, or style the host app outside its sandboxed iframe. Core RemNote documents honor RemNote's native `Dark` interface setting and persist after app restart.
+
+RemNote Community and generated study-deck routes may still render light. RemNote's own packaged app logic excludes those learning/community routes from the global dark-mode predicate, so that behavior is upstream RemNote UI behavior, not caused by this bridge.

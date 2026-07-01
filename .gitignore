@@ -4,4 +4,6 @@ dist/
 .env
 coverage/
 *.tsbuildinfo
+*.swp
+.wrapup/
 plugin/public/remnoteconnect.local.json

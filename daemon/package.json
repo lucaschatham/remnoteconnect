@@ -1,6 +1,6 @@
 {
   "name": "@remnoteconnect/daemon",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -11,7 +11,7 @@
     "typecheck": "pnpm --filter @remnoteconnect/shared build && tsc -p tsconfig.json --noEmit",
     "dev": "pnpm --filter @remnoteconnect/shared build && tsx src/index.ts",
     "start": "node dist/index.js",
-    "token": "pnpm --filter @remnoteconnect/shared build && tsx src/cli.ts token",
+    "token:unsafe": "pnpm --filter @remnoteconnect/shared build && tsx src/cli.ts token --unsafe-print",
     "test": "vitest run"
   },
   "dependencies": {

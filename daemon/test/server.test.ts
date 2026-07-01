@@ -6,6 +6,7 @@ import { WebSocket } from "ws";
 import { buildServer } from "../src/server.js";
 import { loadConfig } from "../src/config.js";
 import { startPluginStaticServer } from "../src/pluginStatic.js";
+import { IRREVERSIBLE_RECONFIRM_PHRASE } from "@remnoteconnect/shared";
 
 function testBundle() {
   const dir = mkdtempSync(join(tmpdir(), "remnote-connect-"));
@@ -746,6 +747,91 @@ describe("daemon server", () => {
     expect(executed.json().error).toBeNull();
     expect(executed.json().result).toMatchObject({ count: 1, remIds: ["trash-1"] });
     expect(seenActions).toEqual(["emptyTrash", "emptyTrash", "emptyTrash", "emptyTrash"]);
+    ws.close();
+    await bundle.app.close();
+  });
+
+  it("requires explicit human re-confirmation to reset the irreversible session budget", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    let executedCount = 0;
+    const { ws, ready } = connectPlugin(port, {
+      onJob(message, socket) {
+        if (message.action !== "emptyTrash") return;
+        if (message.params.confirm === true && message.params.dryRun !== true) executedCount += 1;
+        socket.send(
+          JSON.stringify({
+            type: "result",
+            jobId: message.jobId,
+            result:
+              message.params.dryRun === true || message.params.confirm !== true
+                ? { dryRun: true, count: 1, remIds: ["trash-budget"] }
+                : { count: 1, remIds: ["trash-budget"] },
+            error: null,
+          }),
+        );
+      },
+    });
+    await ready;
+
+    const dryRun = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "emptyTrash", version: 1, params: {} },
+    });
+    const fromDryRun = dryRun.json().result.fromDryRun;
+
+    for (let i = 0; i < 3; i += 1) {
+      const executed = await bundle.app.inject({
+        method: "POST",
+        url: "/",
+        headers: authHeaders,
+        payload: { action: "emptyTrash", version: 1, params: { confirm: true, fromDryRun } },
+      });
+      expect(executed.json().error).toBeNull();
+    }
+
+    const exhausted = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "emptyTrash", version: 1, params: { confirm: true, fromDryRun } },
+    });
+    expect(exhausted.json().error.code).toBe("irreversible_budget_exceeded");
+    expect(executedCount).toBe(3);
+
+    const rejectedReset = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "reconfirmIrreversibleBudget", version: 1, params: { confirm: true, phrase: "reset it" } },
+    });
+    expect(rejectedReset.json().error.code).toBe("confirm_required");
+
+    const reset = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "reconfirmIrreversibleBudget",
+        version: 1,
+        params: { confirm: true, phrase: IRREVERSIBLE_RECONFIRM_PHRASE },
+      },
+    });
+    expect(reset.json().error).toBeNull();
+    expect(reset.json().result.irreversibleRemaining).toBe(3);
+
+    const afterReset = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "emptyTrash", version: 1, params: { confirm: true, fromDryRun } },
+    });
+    expect(afterReset.json().error).toBeNull();
+    expect(executedCount).toBe(4);
+    expect(readFileSync(join(bundle.config.logDir, "audit.jsonl"), "utf8")).toContain("reconfirmIrreversibleBudget");
     ws.close();
     await bundle.app.close();
   });

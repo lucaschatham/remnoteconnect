@@ -14,6 +14,7 @@ function usage() {
   rnc doctor
   rnc status
   rnc metrics
+  rnc reconfirm-irreversible --phrase "I understand irreversible RemNote operations cannot be undone" --confirm
   rnc rotate-token
   rnc map --depth 3 [--root-id ID]
   rnc get ID
@@ -137,6 +138,8 @@ async function main() {
   let result;
   if (command === "describe" || command === "doctor" || command === "status" || command === "metrics") {
     result = await call(command, commonParams(flags));
+  } else if (command === "reconfirm-irreversible") {
+    result = await call("reconfirmIrreversibleBudget", { ...commonParams(flags), phrase: flags.phrase });
   } else if (command === "rotate-token") {
     result = await call("rotateToken", commonParams(flags));
   } else if (command === "map") {

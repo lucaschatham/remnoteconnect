@@ -1,12 +1,12 @@
 {
   "id": "remnoteconnect-codex-local-v3",
-  "name": "RemNoteConnect",
+  "name": "RemNoteConnect Codex Bridge",
   "author": "Lucas Chatham",
   "description": "Private local bridge that lets terminal tools read, author, and safely operate on RemNote through reversible local controls.",
   "repoUrl": "https://localhost.invalid/remnoteconnect",
   "version": {
     "major": 0,
-    "minor": 1,
+    "minor": 2,
     "patch": 0
   },
   "manifestVersion": 1,

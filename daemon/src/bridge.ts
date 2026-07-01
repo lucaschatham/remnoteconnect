@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import {
+  DAEMON_VERSION,
   fail,
   type ApiError,
   type ApiResponse,
@@ -42,6 +43,7 @@ export type BridgeStatus = {
 
 const MAX_JOB_HISTORY = 500;
 const JOB_HISTORY_TTL_MS = 30 * 60 * 1000;
+const HEARTBEAT_INTERVAL_MS = 12_000;
 
 export class PluginBridge {
   private ws?: WebSocket;
@@ -127,6 +129,20 @@ export class PluginBridge {
 
   private attach(ws: WebSocket): void {
     let authenticated = false;
+    let alive = true;
+    const heartbeat = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      if (!alive) {
+        ws.terminate();
+        return;
+      }
+      alive = false;
+      ws.ping();
+    }, HEARTBEAT_INTERVAL_MS);
+
+    ws.on("pong", () => {
+      alive = true;
+    });
 
     ws.on("message", (raw) => {
       let parsed: unknown;
@@ -143,9 +159,15 @@ export class PluginBridge {
           ws.close(1008, "unauthorized");
           return;
         }
-        this.replaceConnection(ws, hello.data);
+        if (!this.replaceConnection(ws, hello.data)) return;
         authenticated = true;
-        ws.send(JSON.stringify({ type: "hello_ack", daemonVersion: "0.1.0" }));
+        ws.send(JSON.stringify({ type: "hello_ack", daemonVersion: DAEMON_VERSION }));
+        return;
+      }
+
+      const heartbeatMessage = parsed as { type?: string };
+      if (heartbeatMessage.type === "ping") {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "pong", at: Date.now() }));
         return;
       }
 
@@ -176,22 +198,31 @@ export class PluginBridge {
     });
 
     ws.on("close", () => {
+      clearInterval(heartbeat);
       if (this.ws === ws) {
         this.ws = undefined;
         this.hello = undefined;
         this.connectedAt = undefined;
+        this.rejectPending("plugin_disconnected", "RemNote plugin disconnected before pending jobs completed.");
       }
     });
   }
 
-  private replaceConnection(ws: WebSocket, hello: PluginHello): void {
+  private replaceConnection(ws: WebSocket, hello: PluginHello): boolean {
     if (this.ws && this.ws !== ws) {
-      this.rejectPending("plugin_reconnected", "RemNote plugin reconnected; in-flight jobs were cancelled.");
+      if (this.ws.readyState === WebSocket.OPEN && this.pending.size > 0) {
+        ws.close(1013, "already connected, in-flight jobs");
+        return false;
+      }
+      if (this.ws.readyState !== WebSocket.OPEN && this.pending.size > 0) {
+        this.rejectPending("plugin_disconnected", "RemNote plugin connection was replaced after disconnect.");
+      }
       this.ws.close(1012, "replaced by a new plugin connection");
     }
     this.ws = ws;
     this.hello = hello;
     this.connectedAt = new Date();
+    return true;
   }
 
   private completeJob(jobId: string, result: unknown, error: { code: string; message: string; details?: unknown } | null): void {

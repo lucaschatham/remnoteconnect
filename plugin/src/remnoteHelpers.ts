@@ -20,6 +20,28 @@ const BUILDER_TEXT_FORMATS = new Set<string>([
   "Pink",
 ]);
 
+export async function yieldToEventLoop(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+export async function mapBounded<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export async function toRichText(plugin: ReactRNPlugin, input: RichTextish): Promise<RichTextInterface> {
   if (input && typeof input === "object" && !Array.isArray(input)) {
     const record = input as Record<string, unknown>;
@@ -122,18 +144,29 @@ function fallbackRichTextToString(input: unknown): string {
 
   const record = input as Record<string, unknown>;
   if (record.i === "s") return record.delimiterCharacterForSerialization === ">>" ? ">>" : "::";
-  if (record.i === "q") return fallbackRichTextToString(record.textOfDeletedRem);
+  if (record.i === "q") {
+    const deletedText = fallbackRichTextToString(record.textOfDeletedRem);
+    if (deletedText) return deletedText;
+    const remId = String(record._id ?? record.remId ?? record.id ?? record.referenceId ?? "");
+    return remId ? `[[${remId}]]` : "{unsupportedRichText:q}";
+  }
   if (record.i === "i") return fallbackRichTextToString(record.label) || fallbackRichTextToString(record.frontLabel) || String(record.title ?? record.url ?? "");
   if (record.i === "a" || record.i === "p") return typeof record.url === "string" ? record.url : "";
   if (record.i === "n") return typeof record.text === "string" ? record.text : fallbackRichTextToString(record.highlighterSerialization);
   if (record.i === "g") return typeof record._id === "string" ? record._id : "";
-  if (record.i === "fi" || record.i === "ai" || record.i === "di") return "";
+  if (record.i === "fi" || record.i === "ai" || record.i === "di") {
+    for (const key of ["url", "src", "source", "fileName", "name"]) {
+      if (typeof record[key] === "string" && record[key]) return record[key] as string;
+    }
+    return `{unsupportedRichText:${record.i}}`;
+  }
   for (const key of ["text", "value", "markdown", "name", "plainText"]) {
     if (typeof record[key] === "string") return record[key] as string;
   }
   for (const key of ["content", "children", "segments", "richText"]) {
     if (Array.isArray(record[key])) return fallbackRichTextToString(record[key]);
   }
+  if (typeof record.i === "string" && record.i) return `{unsupportedRichText:${record.i}}`;
   return "";
 }
 
@@ -145,37 +178,93 @@ export async function getManagedRoot(plugin: ReactRNPlugin, rootName = MANAGED_R
   return root;
 }
 
+const childRemCacheByPlugin = new WeakMap<ReactRNPlugin, Map<string, string>>();
+const childRemPendingByPlugin = new WeakMap<ReactRNPlugin, Map<string, Promise<RemObject>>>();
+
+function childRemCacheKey(parent: RemObject, name: string): string {
+  return `${parent._id}\u0000${name}`;
+}
+
+function childRemCache(plugin: ReactRNPlugin): Map<string, string> {
+  const existing = childRemCacheByPlugin.get(plugin);
+  if (existing) return existing;
+  const created = new Map<string, string>();
+  childRemCacheByPlugin.set(plugin, created);
+  return created;
+}
+
+function childRemPending(plugin: ReactRNPlugin): Map<string, Promise<RemObject>> {
+  const existing = childRemPendingByPlugin.get(plugin);
+  if (existing) return existing;
+  const created = new Map<string, Promise<RemObject>>();
+  childRemPendingByPlugin.set(plugin, created);
+  return created;
+}
+
+async function applyChildOptions(rem: RemObject, options: { folder?: boolean; document?: boolean }): Promise<void> {
+  if (options.folder) await rem.setIsFolder(true);
+  if (options.document) await rem.setIsDocument(true);
+}
+
 export async function ensureChildRem(
   plugin: ReactRNPlugin,
   parent: RemObject,
   name: string,
   options: { folder?: boolean; document?: boolean } = {},
 ): Promise<RemObject> {
-  const richName = await toRichText(plugin, name);
-  const existing = await plugin.rem.findByName(richName, parent._id);
-  const rem = existing ?? (await plugin.rem.createRem());
-  if (!rem) throw new Error(`Unable to create Rem "${name}".`);
-  if (!existing) {
-    await rem.setParent(parent);
-    await rem.setText(richName);
+  const cacheKey = childRemCacheKey(parent, name);
+  const cache = childRemCache(plugin);
+  const pendingByKey = childRemPending(plugin);
+  const cachedId = cache.get(cacheKey);
+  if (cachedId) {
+    const cached = await plugin.rem.findOne(cachedId);
+    if (cached && cached.parent === parent._id) {
+      await applyChildOptions(cached, options);
+      return cached;
+    }
+    cache.delete(cacheKey);
   }
-  if (options.folder) await rem.setIsFolder(true);
-  if (options.document) await rem.setIsDocument(true);
-  return rem;
+
+  const pending = pendingByKey.get(cacheKey);
+  if (pending) {
+    const rem = await pending;
+    await applyChildOptions(rem, options);
+    return rem;
+  }
+
+  const created = (async () => {
+    const richName = await toRichText(plugin, name);
+    const existing = await plugin.rem.findByName(richName, parent._id);
+    const rem = existing ?? (await plugin.rem.createRem());
+    if (!rem) throw new Error(`Unable to create Rem "${name}".`);
+    if (!existing) {
+      await rem.setParent(parent);
+      await rem.setText(richName);
+    }
+    cache.set(cacheKey, rem._id);
+    await applyChildOptions(rem, options);
+    return rem;
+  })();
+  pendingByKey.set(cacheKey, created);
+  try {
+    return await created;
+  } finally {
+    pendingByKey.delete(cacheKey);
+  }
 }
 
 export async function ensurePath(
   plugin: ReactRNPlugin,
   path: string | undefined,
   rootName = MANAGED_ROOT_NAME,
-  options: { finalAsDocument?: boolean; finalAsFolder?: boolean } = {},
+  options: { finalAsDocument?: boolean; finalAsFolder?: boolean; plain?: boolean } = {},
 ): Promise<RemObject> {
   let parent = await getManagedRoot(plugin, rootName);
   const parts = normalizePath(path ?? "");
   for (let i = 0; i < parts.length; i += 1) {
     parent = await ensureChildRem(plugin, parent, parts[i], {
-      folder: options.finalAsFolder || i < parts.length - 1,
-      document: options.finalAsDocument && i === parts.length - 1,
+      folder: !options.plain && (options.finalAsFolder || i < parts.length - 1),
+      document: !options.plain && options.finalAsDocument && i === parts.length - 1,
     });
   }
   return parent;
@@ -291,25 +380,25 @@ export async function findGraphRems(plugin: ReactRNPlugin, query: string | undef
         : directMatches;
     } else if (term.type === "text") {
       const needle = term.value.toLowerCase();
-      const checked = await Promise.all((await candidateRems()).map(async (rem) => {
+      const checked = await mapBounded(await candidateRems(), 32, async (rem) => {
         const text = `${await richTextToString(plugin, rem.text)} ${await richTextToString(plugin, rem.backText)}`.toLowerCase();
         return text.includes(needle) ? rem : undefined;
-      }));
+      });
       rems = checked.filter((rem): rem is RemObject => Boolean(rem));
     } else if (term.type === "deck") {
       const wanted = normalizePath(term.value).join("::").toLowerCase();
-      const checked = await Promise.all((await candidateRems()).map(async (rem) => {
+      const checked = await mapBounded(await candidateRems(), 32, async (rem) => {
         const path = (await remPath(plugin, rem, root)).toLowerCase();
         return path === wanted || path.startsWith(`${wanted}::`) ? rem : undefined;
-      }));
+      });
       rems = checked.filter((rem): rem is RemObject => Boolean(rem));
     } else if (term.type === "tag") {
       const wanted = term.value.toLowerCase();
-      const checked = await Promise.all((await candidateRems()).map(async (rem) => {
+      const checked = await mapBounded(await candidateRems(), 32, async (rem) => {
         const tags = await rem.getTagRems();
-        const tagNames = await Promise.all(tags.map((tag) => richTextToString(plugin, tag.text)));
+        const tagNames = await mapBounded(tags, 8, (tag) => richTextToString(plugin, tag.text));
         return tagNames.some((tag) => tag.toLowerCase() === wanted) ? rem : undefined;
-      }));
+      });
       rems = checked.filter((rem): rem is RemObject => Boolean(rem));
     }
   }

@@ -6,6 +6,7 @@ import { PluginActionError } from "./errors.js";
 const DAEMON_URL_SETTING = "daemonUrl";
 const TOKEN_SETTING = "daemonToken";
 const TOKEN_STORAGE_KEY = "remnoteconnect.daemonToken";
+const PLUGIN_VERSION = "0.2.0";
 
 const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {};
 const ENV_DAEMON_URL = env.VITE_REMNOTE_CONNECT_DAEMON_URL;
@@ -15,6 +16,8 @@ export class BridgeClient {
   private socket?: WebSocket;
   private stopped = false;
   private reconnectTimer?: number;
+  private heartbeatTimer?: number;
+  private reconnectDelayMs = 500;
 
   constructor(private readonly plugin: ReactRNPlugin) {}
 
@@ -28,7 +31,7 @@ export class BridgeClient {
     await this.plugin.settings.registerStringSetting({
       id: TOKEN_SETTING,
       title: "Daemon token",
-      description: "Paste the token printed by `pnpm token`.",
+      description: "Paste the daemon token only during manual recovery; prefer token rotation/pairing.",
       defaultValue: "",
     });
   }
@@ -40,11 +43,15 @@ export class BridgeClient {
 
   stop(): void {
     this.stopped = true;
-    if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
+    this.clearReconnectTimer();
+    this.stopHeartbeat();
     this.socket?.close();
+    this.socket = undefined;
   }
 
   private async connect(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) return;
+    this.clearReconnectTimer();
     const url = (await this.plugin.settings.getSetting<string>(DAEMON_URL_SETTING)) || ENV_DAEMON_URL || DEFAULT_BRIDGE_URL;
     const storage = window.localStorage as Storage | undefined;
     const storedToken = typeof storage?.getItem === "function" ? storage.getItem(TOKEN_STORAGE_KEY) || "" : "";
@@ -59,11 +66,15 @@ export class BridgeClient {
     this.socket = socket;
 
     socket.addEventListener("open", () => {
+      if (this.socket !== socket) return;
+      this.clearReconnectTimer();
+      this.reconnectDelayMs = 500;
+      this.startHeartbeat(socket);
       socket.send(
         JSON.stringify({
           type: "hello",
           token,
-          pluginVersion: "0.1.0",
+          pluginVersion: PLUGIN_VERSION,
           transport: "websocket",
           capabilities: capabilityMatrix(),
         }),
@@ -71,17 +82,58 @@ export class BridgeClient {
     });
 
     socket.addEventListener("message", (event) => {
+      if (this.socket !== socket) return;
       void this.handleMessage(String(event.data));
     });
 
-    socket.addEventListener("close", () => this.scheduleReconnect());
-    socket.addEventListener("error", () => this.scheduleReconnect());
+    socket.addEventListener("close", () => {
+      if (this.socket !== socket) return;
+      this.socket = undefined;
+      this.stopHeartbeat();
+      this.scheduleReconnect();
+    });
+    socket.addEventListener("error", () => this.handleSocketFailure(socket));
+  }
+
+  private clearReconnectTimer(): void {
+    if (!this.reconnectTimer) return;
+    window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
   }
 
   private scheduleReconnect(): void {
     if (this.stopped) return;
-    if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = window.setTimeout(() => void this.connect(), 2000);
+    this.clearReconnectTimer();
+    const jitter = Math.floor(Math.random() * Math.min(500, this.reconnectDelayMs));
+    const delay = this.reconnectDelayMs + jitter;
+    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 8000);
+    this.reconnectTimer = window.setTimeout(() => void this.connect(), delay);
+  }
+
+  private handleSocketFailure(socket: WebSocket): void {
+    if (this.socket !== socket) return;
+    this.socket = undefined;
+    this.stopHeartbeat();
+    try {
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
+    } catch {
+      // Nothing to do; the reconnect timer below owns recovery.
+    }
+    this.scheduleReconnect();
+  }
+
+  private startHeartbeat(socket: WebSocket): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = window.setInterval(() => {
+      if (this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({ type: "ping", at: Date.now() }));
+    }, 10_000);
+  }
+
+  private stopHeartbeat(): void {
+    if (!this.heartbeatTimer) return;
+    window.clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
   }
 
   private async handleMessage(raw: string): Promise<void> {

@@ -13,12 +13,7 @@ export function isAllowedHost(hostHeader: string | undefined, config: DaemonConf
 export function isAllowedOrigin(origin: string | undefined, config: DaemonConfig): boolean {
   if (!origin) return true;
   if (config.allowedOrigins.includes(origin)) return true;
-  try {
-    const parsed = new URL(origin);
-    return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
-  } catch {
-    return false;
-  }
+  return false;
 }
 
 export function bearerToken(request: FastifyRequest): string | undefined {

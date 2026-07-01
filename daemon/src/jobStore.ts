@@ -1,6 +1,8 @@
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { access, appendFile, mkdir, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 
 export type DurableJobStatus = "queued" | "running" | "complete" | "error";
 
@@ -41,28 +43,96 @@ export function createDurableJob(action: DurableJobRecord["action"], params: Rec
   };
 }
 
+function compactFinishedParams(params: Record<string, unknown>): Record<string, unknown> {
+  const keep = ["batchId", "deckPath", "deckName", "parentPath", "externalId"];
+  const compact: Record<string, unknown> = {};
+  for (const key of keep) {
+    if (params[key] !== undefined) compact[key] = params[key];
+  }
+  return compact;
+}
+
+function snapshotForAppend(job: DurableJobRecord): Partial<DurableJobRecord> {
+  const snapshot: Partial<DurableJobRecord> = {
+    ...job,
+    updatedAt: new Date().toISOString(),
+    progress: job.progress.slice(-20),
+  };
+  if (job.status === "complete" || job.status === "error") {
+    snapshot.params = compactFinishedParams(job.params);
+  } else if (!(job.status === "queued" && job.cursor === 0)) {
+    delete snapshot.params;
+  }
+  return snapshot;
+}
+
+function snapshotForCompaction(job: DurableJobRecord): Partial<DurableJobRecord> {
+  const snapshot: Partial<DurableJobRecord> = {
+    ...job,
+    progress: job.progress.slice(-20),
+  };
+  if (job.status === "complete" || job.status === "error") {
+    snapshot.params = compactFinishedParams(job.params);
+  }
+  return snapshot;
+}
+
+function mergeSnapshot(previous: DurableJobRecord | undefined, snapshot: Partial<DurableJobRecord>): DurableJobRecord | undefined {
+  if (snapshot.schemaVersion !== 1 || typeof snapshot.jobId !== "string" || typeof snapshot.action !== "string") return previous;
+  const merged = { ...(previous ?? {}), ...snapshot } as DurableJobRecord;
+  if (snapshot.params === undefined && previous?.params) merged.params = previous.params;
+  if (snapshot.progress === undefined && previous?.progress) merged.progress = previous.progress;
+  if (snapshot.ids === undefined && previous?.ids) merged.ids = previous.ids;
+  return merged;
+}
+
+async function readSnapshots(appDir: string, onSnapshot: (snapshot: Partial<DurableJobRecord>) => void): Promise<void> {
+  const file = jobStorePath(appDir);
+  try {
+    await access(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const stream = createReadStream(file, { encoding: "utf8" });
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line.trim()) continue;
+    onSnapshot(JSON.parse(line) as Partial<DurableJobRecord>);
+  }
+}
+
 export async function appendJobSnapshot(appDir: string, job: DurableJobRecord): Promise<void> {
   await mkdir(appDir, { recursive: true });
-  await appendFile(jobStorePath(appDir), `${JSON.stringify({ ...job, updatedAt: new Date().toISOString() })}\n`, { mode: 0o600 });
+  await appendFile(jobStorePath(appDir), `${JSON.stringify(snapshotForAppend(job))}\n`, { mode: 0o600 });
 }
 
 export async function readDurableJobs(appDir: string): Promise<Map<string, DurableJobRecord>> {
   const jobs = new Map<string, DurableJobRecord>();
-  try {
-    const body = await readFile(jobStorePath(appDir), "utf8");
-    for (const line of body.split("\n")) {
-      if (!line.trim()) continue;
-      const job = JSON.parse(line) as Partial<DurableJobRecord>;
-      if (job.schemaVersion === 1 && typeof job.jobId === "string" && typeof job.action === "string") {
-        jobs.set(job.jobId, job as DurableJobRecord);
-      }
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
+  await readSnapshots(appDir, (snapshot) => {
+    const merged = mergeSnapshot(jobs.get(String(snapshot.jobId)), snapshot);
+    if (merged) jobs.set(merged.jobId, merged);
+  });
   return jobs;
 }
 
 export async function readDurableJob(appDir: string, jobId: string): Promise<DurableJobRecord | undefined> {
-  return (await readDurableJobs(appDir)).get(jobId);
+  let job: DurableJobRecord | undefined;
+  await readSnapshots(appDir, (snapshot) => {
+    if (snapshot.jobId !== jobId) return;
+    job = mergeSnapshot(job, snapshot);
+  });
+  return job;
+}
+
+export async function compactDurableJobs(appDir: string): Promise<{ jobs: number }> {
+  const jobs = await readDurableJobs(appDir);
+  if (jobs.size === 0) return { jobs: 0 };
+  await mkdir(appDir, { recursive: true });
+  const file = jobStorePath(appDir);
+  const tmp = `${file}.${process.pid}.tmp`;
+  const lines = [...jobs.values()].map((job) => `${JSON.stringify(snapshotForCompaction(job))}\n`).join("");
+  await writeFile(tmp, lines, { mode: 0o600 });
+  await rename(tmp, file);
+  return { jobs: jobs.size };
 }

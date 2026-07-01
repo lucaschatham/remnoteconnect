@@ -186,7 +186,6 @@ export class FakeRem {
   }
 
   async remove(): Promise<void> {
-    for (const child of await this.getChildrenRem()) await child.remove();
     for (const card of [...this.cards]) await card.remove();
     this.removed = true;
     this.graph.removeFromOrder(this._id, this.parent);

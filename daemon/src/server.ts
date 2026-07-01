@@ -1,13 +1,15 @@
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { randomBytes } from "node:crypto";
-import { chmod, writeFile } from "node:fs/promises";
+import { chmod, readFile, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import {
   ApiEnvelopeSchema,
   DAEMON_VERSION,
   actionMetadata,
   getActionMetadata,
   fail,
+  IRREVERSIBLE_RECONFIRM_PHRASE,
   isPluginAction,
   nativeActions,
   adapterActions,
@@ -15,6 +17,7 @@ import {
   plannedActions,
   pluginActions,
   PROTOCOL_VERSION,
+  retryableBridgeError,
   unsupportedAnkiActions,
   type ApiError,
   type ApiResponse,
@@ -46,6 +49,10 @@ const MAX_MULTI_ACTIONS = 50;
 const MAGNITUDE_THRESHOLD = 50;
 const IRREVERSIBLE_SESSION_BUDGET = 3;
 const ENABLE_ACTION_LOGS = process.env.REMNOTE_CONNECT_LOG === "1";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function writeTokenFile(path: string, token: string): Promise<void> {
   await writeFile(path, `${token}\n`, { mode: 0o600 });
@@ -127,6 +134,25 @@ function consumesIrreversibleBudget(action: string, params: Record<string, unkno
   return Boolean(meta?.requiresDryRunHash || meta?.irreversible || (action === "mergeRems" && params.structural === true));
 }
 
+async function runBridgeJob(
+  bridge: PluginBridge,
+  action: string,
+  params: Record<string, unknown>,
+  timeoutMs: number,
+  retryable: boolean,
+): Promise<unknown> {
+  const attempts = retryable ? 3 : 1;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await bridge.runJob(action, params, timeoutMs);
+    } catch (error) {
+      if (!retryable || attempt >= attempts || !retryableBridgeError(error)) throw error;
+      await sleep(250 * attempt);
+    }
+  }
+  throw { code: "internal_error", message: "Bridge retry loop exhausted unexpectedly." } satisfies ApiError;
+}
+
 async function dispatchAction(
   action: string,
   params: Record<string, unknown>,
@@ -163,6 +189,15 @@ async function dispatchAction(
       actions: actionMetadata,
       magnitudeThreshold: MAGNITUDE_THRESHOLD,
       irreversibleSessionBudget: IRREVERSIBLE_SESSION_BUDGET,
+      irreversibleReconfirmPhrase: IRREVERSIBLE_RECONFIRM_PHRASE,
+      migrationFeatures: {
+        durableAsync: true,
+        parseAndInsertHtml: true,
+        clozeWrite: true,
+        mediaPipeline: "daemon-local-url",
+        noteTypeMapping: "scripts/anki-migrate.mjs",
+        finalAsDocument: true,
+      },
       queryGrammar: ["deck:<path>", "tag:<tag>", "text:<string>", "id:<remId>"],
     });
   }
@@ -173,6 +208,26 @@ async function dispatchAction(
       bridge: bridgeStatus,
       irreversibleRemaining: state.irreversibleRemaining,
       dryRunHashesRetained: state.dryRunHashes.size,
+    });
+  }
+  if (action === "reconfirmIrreversibleBudget") {
+    const phrase = typeof params.phrase === "string" ? params.phrase.trim() : "";
+    if (params.confirm !== true || phrase !== IRREVERSIBLE_RECONFIRM_PHRASE) {
+      return fail("confirm_required", "reconfirmIrreversibleBudget requires confirm:true and the exact irreversible confirmation phrase.", {
+        phrase: IRREVERSIBLE_RECONFIRM_PHRASE,
+      });
+    }
+    state.irreversibleRemaining = IRREVERSIBLE_SESSION_BUDGET;
+    await appendAudit(config.logDir, {
+      ts: new Date().toISOString(),
+      action: "reconfirmIrreversibleBudget",
+      targetIds: [],
+      count: IRREVERSIBLE_SESSION_BUDGET,
+      status: "success",
+    });
+    return ok({
+      irreversibleRemaining: state.irreversibleRemaining,
+      irreversibleSessionBudget: IRREVERSIBLE_SESSION_BUDGET,
     });
   }
   if (action === "rotateToken") {
@@ -210,7 +265,7 @@ async function dispatchAction(
     let okStatus = bridgeStatus.connected;
     if (bridgeStatus.connected) {
       try {
-        const scopeProbe = await bridge.runJob("scopeProbe", {}, 60_000);
+        const scopeProbe = await runBridgeJob(bridge, "scopeProbe", {}, 60_000, true);
         checks.scopeProbe = scopeProbe;
         okStatus = resultRecord(scopeProbe).ok === true;
       } catch (error) {
@@ -254,7 +309,7 @@ async function dispatchAction(
     try {
       const undoRecord = await readUndoRecord(config.appDir, opId);
       const started = Date.now();
-      const result = await bridge.runJob("undo", { undoRecord }, pluginActionTimeout("undo", params));
+      const result = await runBridgeJob(bridge, "undo", { undoRecord }, pluginActionTimeout("undo", params), false);
       await appendAudit(config.logDir, {
         ts: new Date().toISOString(),
         action: "undo",
@@ -271,7 +326,7 @@ async function dispatchAction(
   }
   if (action === "backupGraph") {
     try {
-      const snapshot = (await bridge.runJob("backupGraph", params, 10 * 60_000)) as RemSnapshot;
+      const snapshot = (await runBridgeJob(bridge, "backupGraph", params, 10 * 60_000, true)) as RemSnapshot;
       return ok(await writeSnapshotBackup(config.backupDir, "graph", snapshot));
     } catch (error) {
       return responseFromError(error);
@@ -282,11 +337,21 @@ async function dispatchAction(
     if (!file) return fail("bad_request", "restoreBackup requires file or path.");
     try {
       const snapshot = await readSnapshotBackup(config.backupDir, file);
-      return ok(
-        await bridge.runJob("importSnapshot", {
+      const rest = { ...params };
+      delete rest.file;
+      delete rest.path;
+      return dispatchAction(
+        "importSnapshot",
+        {
+          ...rest,
           snapshot,
           parentPath: typeof params.parentPath === "string" ? params.parentPath : "__restored__",
-        }),
+        },
+        bridge,
+        durableJobs,
+        config,
+        state,
+        depth + 1,
       );
     } catch (error) {
       return responseFromError(error);
@@ -341,7 +406,7 @@ async function dispatchAction(
     let preflight: unknown;
     let hash: string | undefined;
     if (needsSafetyPreflight) {
-      preflight = await bridge.runJob(action, { ...actionParams, dryRun: true, confirm: false }, pluginActionTimeout(action, actionParams));
+      preflight = await runBridgeJob(bridge, action, { ...actionParams, dryRun: true, confirm: false }, pluginActionTimeout(action, actionParams), true);
       const count = countFromResult(preflight);
       if (typeof count === "number" && count > MAGNITUDE_THRESHOLD && Number(actionParams.confirmCount) !== count) {
         return fail("magnitude_guard", `${action} resolved ${count} targets. Pass confirmCount:${count} to execute.`, {
@@ -359,13 +424,13 @@ async function dispatchAction(
           return fail("dry_run_mismatch", `${action} fromDryRun does not match the current target set.`, { expected: hash });
         }
         if (state.irreversibleRemaining <= 0) {
-          return fail("irreversible_budget_exceeded", "Irreversible operation session budget is exhausted. Restart the daemon or add a human re-confirm flow.");
+          return fail("irreversible_budget_exceeded", "Irreversible operation session budget is exhausted. Run reconfirmIrreversibleBudget with explicit human confirmation before continuing.");
         }
         actionParams.irreversibleVerified = true;
       }
     }
 
-    const result = await bridge.runJob(action, actionParams, pluginActionTimeout(action, actionParams));
+    const result = await runBridgeJob(bridge, action, actionParams, pluginActionTimeout(action, actionParams), actionMeta?.retryable === true);
     const resultHash = actionRequiresDryRunHash && resultRecord(result).dryRun === true ? dryRunHash(action, result) : undefined;
     if (resultHash) {
       state.dryRunHashes.add(resultHash);
@@ -429,6 +494,29 @@ function setCors(reply: FastifyReply, origin?: string): void {
   reply.header("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
 }
 
+function mediaContentType(name: string): string {
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".svg")) return "image/svg+xml";
+  if (lower.endsWith(".mp3")) return "audio/mpeg";
+  if (lower.endsWith(".wav")) return "audio/wav";
+  if (lower.endsWith(".ogg")) return "audio/ogg";
+  return "application/octet-stream";
+}
+
+async function readMediaFile(config: DaemonConfig, name: string): Promise<{ body: Buffer; contentType: string }> {
+  if (!/^[a-f0-9]{64}(?:\.[A-Za-z0-9]+)?$/.test(name)) {
+    throw { code: "bad_request", message: "Invalid media name." } satisfies ApiError;
+  }
+  const mediaRoot = resolve(join(config.appDir, "media"));
+  const mediaFile = resolve(join(mediaRoot, name));
+  if (!mediaFile.startsWith(`${mediaRoot}/`)) throw { code: "bad_request", message: "Invalid media path." } satisfies ApiError;
+  return { body: await readFile(mediaFile), contentType: mediaContentType(name) };
+}
+
 export function buildServer(config: DaemonConfig): ServerBundle {
   const app = Fastify({ logger: false });
   const bridge = new PluginBridge(config);
@@ -461,7 +549,7 @@ export function buildServer(config: DaemonConfig): ServerBundle {
       return;
     }
     setCors(reply, origin);
-    if (request.method === "OPTIONS" || request.url === "/health") return;
+    if (request.method === "OPTIONS" || request.url === "/health" || (request.method === "GET" && request.url.startsWith("/media/"))) return;
     if (!safeTokenEqual(bearerToken(request), config.token)) {
       reply.code(401).send(fail("unauthorized", "Missing or invalid bearer token."));
     }
@@ -472,6 +560,19 @@ export function buildServer(config: DaemonConfig): ServerBundle {
   });
 
   app.get("/health", async () => ok({ ok: true, daemonVersion: DAEMON_VERSION }));
+
+  app.get("/media/:name", async (request: FastifyRequest<{ Params: { name: string } }>, reply) => {
+    try {
+      const media = await readMediaFile(config, request.params.name);
+      reply.header("Cache-Control", "public, max-age=31536000, immutable");
+      reply.type(media.contentType);
+      return media.body;
+    } catch (error) {
+      const response = responseFromError(error);
+      reply.code(response.error?.code === "bad_request" ? 400 : 404);
+      return response;
+    }
+  });
 
   app.post("/", async (request: FastifyRequest, reply) => {
     const parsed = ApiEnvelopeSchema.safeParse(request.body);

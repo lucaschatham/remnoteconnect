@@ -1,12 +1,13 @@
 import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1;
-export const DAEMON_VERSION = "0.1.0";
+export const DAEMON_VERSION = "0.2.0";
 export const DEFAULT_DAEMON_HOST = "127.0.0.1";
 export const DEFAULT_DAEMON_PORT = 8766;
 export const DEFAULT_DAEMON_URL = `http://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}`;
 export const DEFAULT_BRIDGE_URL = `ws://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}/bridge`;
 export const MANAGED_ROOT_NAME = "RemNoteConnect";
+export const IRREVERSIBLE_RECONFIRM_PHRASE = "I understand irreversible RemNote operations cannot be undone";
 
 export const ApiEnvelopeSchema = z.object({
   action: z.string().min(1),
@@ -129,6 +130,7 @@ export type ActionMetadata = {
   reversible: boolean;
   irreversible: boolean;
   bulk: boolean;
+  retryable?: boolean;
   requiresDryRunHash: boolean;
   magnitudeGuarded: boolean;
   minimalReturn: string;
@@ -141,6 +143,11 @@ function action(meta: ActionMetadata): ActionMetadata {
   return meta;
 }
 
+export function retryableBridgeError(error: unknown): boolean {
+  const code = (error as Partial<ApiError>)?.code;
+  return code === "plugin_disconnected" || code === "plugin_reconnected" || code === "timeout";
+}
+
 export const actionMetadata = {
   version: action({
     name: "version",
@@ -149,6 +156,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: false,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "number",
@@ -163,6 +171,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: false,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{bridge}",
@@ -226,6 +235,20 @@ export const actionMetadata = {
     handler: "daemon",
     implemented: true,
   }),
+  reconfirmIrreversibleBudget: action({
+    name: "reconfirmIrreversibleBudget",
+    summary: "Reset the irreversible operation session budget after explicit human re-confirmation.",
+    mutates: false,
+    reversible: true,
+    irreversible: false,
+    bulk: false,
+    requiresDryRunHash: false,
+    magnitudeGuarded: false,
+    minimalReturn: "{irreversibleRemaining}",
+    cliName: "reconfirm-irreversible",
+    handler: "daemon",
+    implemented: true,
+  }),
   rotateToken: action({
     name: "rotateToken",
     summary: "Rotate the local daemon token and persist it into connected plugin-local storage without returning the token.",
@@ -247,6 +270,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "ApiResponse[]",
@@ -275,10 +299,25 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: false,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{ok,totalRems,managedRootId}",
     cliName: "scope-probe",
+    handler: "plugin",
+    implemented: true,
+  }),
+  ankiMigrationProbes: action({
+    name: "ankiMigrationProbes",
+    summary: "Runtime probes for Anki migration fidelity: cloze, HTML, media, and deck-as-document.",
+    mutates: true,
+    reversible: true,
+    irreversible: false,
+    bulk: false,
+    requiresDryRunHash: false,
+    magnitudeGuarded: false,
+    minimalReturn: "{ok,probes}",
+    cliName: "anki-migration-probes",
     handler: "plugin",
     implemented: true,
   }),
@@ -289,6 +328,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: false,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{id}",
@@ -443,6 +483,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: false,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "AuditEvent[]",
@@ -471,6 +512,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{path,sha256,nodeCount,warning}",
@@ -485,6 +527,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "tsv",
@@ -499,6 +542,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: false,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{id,text,parentId}",
@@ -513,6 +557,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{count,ids}",
@@ -527,6 +572,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{count,ids}",
@@ -541,6 +587,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{root,remCount}",
@@ -597,6 +644,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: false,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{id,text}",
@@ -611,6 +659,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{count,ids}",
@@ -625,6 +674,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{count,ids}",
@@ -639,6 +689,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "snapshot",
@@ -653,6 +704,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "snapshot",
@@ -667,6 +719,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: false,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{valid,nodeCount,warning}",
@@ -678,8 +731,8 @@ export const actionMetadata = {
     name: "importSnapshot",
     summary: "Restore snapshot as copies with new ids.",
     mutates: true,
-    reversible: false,
-    irreversible: true,
+    reversible: true,
+    irreversible: false,
     bulk: true,
     requiresDryRunHash: false,
     magnitudeGuarded: true,
@@ -692,8 +745,8 @@ export const actionMetadata = {
     name: "restoreBackup",
     summary: "Read a daemon backup and import it as copies.",
     mutates: true,
-    reversible: false,
-    irreversible: true,
+    reversible: true,
+    irreversible: false,
     bulk: true,
     requiresDryRunHash: false,
     magnitudeGuarded: true,
@@ -751,6 +804,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: false,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "boolean",
@@ -765,6 +819,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "string[]",
@@ -779,6 +834,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "RemSummary[]",
@@ -793,6 +849,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "string[]",
@@ -849,6 +906,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "markdown",
@@ -891,6 +949,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: false,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{properties}",
@@ -919,6 +978,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{count,tombstones}",
@@ -961,6 +1021,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{groups}",
@@ -989,6 +1050,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{count,ids}",
@@ -1003,6 +1065,7 @@ export const actionMetadata = {
     reversible: true,
     irreversible: false,
     bulk: true,
+    retryable: true,
     requiresDryRunHash: false,
     magnitudeGuarded: false,
     minimalReturn: "{count,ids}",
@@ -1117,6 +1180,8 @@ export type CreateFlashcardParams = {
   tags?: string[];
   externalId?: string;
   batchId?: string;
+  plainDeckPath?: boolean;
+  replaceChildrenOnUpdate?: boolean;
   practiceDirection?: "forward" | "backward" | "none" | "both";
 };
 
@@ -1176,6 +1241,7 @@ export const nativeActions = [
   "describe",
   "doctor",
   "metrics",
+  "reconfirmIrreversibleBudget",
   "rotateToken",
   "multi",
   "jobStatus",

@@ -1,5 +1,5 @@
 import type { ApiError, ApiResponse } from "@remnoteconnect/shared";
-import { fail, ok } from "@remnoteconnect/shared";
+import { fail, ok, retryableBridgeError } from "@remnoteconnect/shared";
 import type { DaemonConfig } from "./config.js";
 import type { PluginBridge } from "./bridge.js";
 import { appendExternalId, readExternalIdMap } from "./externalIdIndex.js";
@@ -40,11 +40,6 @@ function externalIdFromItem(pluginAction: "createFlashcard" | "addNote", item: R
 function idFromResult(result: unknown): string | undefined {
   const record = asRecord(result);
   return str(record.id);
-}
-
-function retryableBridgeError(error: unknown): boolean {
-  const code = (error as Partial<ApiError>)?.code;
-  return code === "plugin_disconnected" || code === "plugin_reconnected" || code === "timeout";
 }
 
 function publicError(error: unknown): { code: string; message: string; details?: unknown } {
@@ -163,6 +158,7 @@ export class DurableJobManager {
 
   private async processFlashcards(job: DurableJobRecord): Promise<void> {
     const { pluginAction, items } = cardsFromParams(job.params);
+    const itemTimeoutMs = Number(job.params.itemTimeoutMs ?? 120_000);
     const inherited = {
       deckPath: job.params.deckPath ?? job.params.deckName,
       tags: job.params.tags,
@@ -181,7 +177,7 @@ export class DurableJobManager {
         const existingRemId = (await readExternalIdMap(this.config.appDir)).get(externalId);
         if (existingRemId) params.existingRemId = existingRemId;
       }
-      const result = await this.bridge.runJob(pluginAction, params, 120_000);
+      const result = await this.bridge.runJob(pluginAction, params, itemTimeoutMs);
       const id = idFromResult(result);
       if (id) {
         job.ids = [...new Set([...job.ids, id])];

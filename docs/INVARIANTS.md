@@ -32,6 +32,8 @@ If an operation resolves more than 50 targets, execution requires `confirmCount:
 
 Irreversible operations, currently `emptyTrash` and future structural merges, require `fromDryRun:<hash>` from a prior dry run. The daemon enforces an in-memory irreversible session budget of 3 operations.
 
+When that budget is exhausted, the only valid reset path is `reconfirmIrreversibleBudget` with `confirm:true` and the exact human confirmation phrase. Do not raise the default budget or restart the daemon to bypass this gate during testing.
+
 No code path may call `rem.remove()` except the `emptyTrash` implementation.
 
 ## Scope Proving
