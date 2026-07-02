@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import {
+  BUILD_HASH,
   DAEMON_VERSION,
   fail,
   type ApiError,
@@ -34,6 +35,7 @@ export type BridgeStatus = {
   connected: boolean;
   connectedAt?: string;
   pluginVersion?: string;
+  pluginBuildHash?: string;
   transport?: "websocket";
   capabilities?: Record<string, unknown>;
   pendingJobs: number;
@@ -72,6 +74,7 @@ export class PluginBridge {
       connected: this.ws?.readyState === WebSocket.OPEN && Boolean(this.hello),
       connectedAt: this.connectedAt?.toISOString(),
       pluginVersion: this.hello?.pluginVersion,
+      pluginBuildHash: this.hello?.pluginBuildHash,
       transport: this.hello?.transport,
       capabilities: this.hello?.capabilities,
       pendingJobs: this.pending.size,
@@ -161,7 +164,7 @@ export class PluginBridge {
         }
         if (!this.replaceConnection(ws, hello.data)) return;
         authenticated = true;
-        ws.send(JSON.stringify({ type: "hello_ack", daemonVersion: DAEMON_VERSION }));
+        ws.send(JSON.stringify({ type: "hello_ack", daemonVersion: DAEMON_VERSION, daemonBuildHash: BUILD_HASH }));
         return;
       }
 
@@ -258,6 +261,7 @@ export class PluginBridge {
       code === "dry_run_required" ||
       code === "dry_run_mismatch" ||
       code === "magnitude_guard" ||
+      code === "readonly_mode" ||
       code === "irreversible_budget_exceeded" ||
       code === "forbidden_target" ||
       code === "backup_failed" ||

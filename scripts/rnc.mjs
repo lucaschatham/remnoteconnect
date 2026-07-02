@@ -14,6 +14,7 @@ function usage() {
   rnc doctor
   rnc status
   rnc metrics
+  rnc readonly on|off|status
   rnc capability-probes [--confirm]
   rnc reconfirm-irreversible --phrase "I understand irreversible RemNote operations cannot be undone" --confirm
   rnc rotate-token
@@ -140,6 +141,9 @@ async function main() {
   let result;
   if (command === "describe" || command === "doctor" || command === "status" || command === "metrics") {
     result = await call(command, commonParams(flags));
+  } else if (command === "readonly") {
+    const mode = args[1] ?? flags.mode ?? "status";
+    result = await call("readonly", { mode });
   } else if (command === "capability-probes") {
     result = await call("capabilityProbes", { ...commonParams(flags), runId: flags.runId });
   } else if (command === "reconfirm-irreversible") {

@@ -5,6 +5,7 @@ import { chmod, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   ApiEnvelopeSchema,
+  BUILD_HASH,
   DAEMON_VERSION,
   actionMetadata,
   getActionMetadata,
@@ -42,6 +43,7 @@ type DispatchState = {
   dryRunHashes: Set<string>;
   irreversibleRemaining: number;
   startedAt: number;
+  readonlyMode: boolean;
 };
 
 const MAX_MULTI_DEPTH = 1;
@@ -135,6 +137,10 @@ function consumesIrreversibleBudget(action: string, params: Record<string, unkno
   return Boolean(meta?.requiresDryRunHash || meta?.irreversible || (action === "mergeRems" && params.structural === true));
 }
 
+function isBlockedByReadonly(action: string, state: DispatchState): boolean {
+  return state.readonlyMode && getActionMetadata(action)?.mutates === true;
+}
+
 async function runBridgeJob(
   bridge: PluginBridge,
   action: string,
@@ -167,7 +173,9 @@ async function dispatchAction(
   if (action === "status") {
     return ok({
       daemonVersion: DAEMON_VERSION,
+      daemonBuildHash: BUILD_HASH,
       protocolVersion: PROTOCOL_VERSION,
+      readonlyMode: state.readonlyMode,
       appDir: config.appDir,
       backupDir: config.backupDir,
       logDir: config.logDir,
@@ -199,6 +207,8 @@ async function dispatchAction(
         noteTypeMapping: "scripts/anki-migrate.mjs",
         finalAsDocument: true,
       },
+      daemonBuildHash: BUILD_HASH,
+      readonlyMode: state.readonlyMode,
       queryGrammar: ["deck:<path>", "tag:<tag>", "text:<string>", "id:<remId>"],
     });
   }
@@ -207,8 +217,39 @@ async function dispatchAction(
     return ok({
       uptimeMs: Date.now() - state.startedAt,
       bridge: bridgeStatus,
+      readonlyMode: state.readonlyMode,
+      daemonBuildHash: BUILD_HASH,
       irreversibleRemaining: state.irreversibleRemaining,
       dryRunHashesRetained: state.dryRunHashes.size,
+    });
+  }
+  if (action === "readonly") {
+    const mode = typeof params.mode === "string" ? params.mode : typeof params.enabled === "boolean" ? (params.enabled ? "on" : "off") : "status";
+    if (mode !== "on" && mode !== "off" && mode !== "status") {
+      return fail("bad_request", "readonly mode must be one of: on, off, status.");
+    }
+    const previous = state.readonlyMode;
+    if (mode === "on") state.readonlyMode = true;
+    if (mode === "off") state.readonlyMode = false;
+    if (previous !== state.readonlyMode) {
+      await appendAudit(config.logDir, {
+        ts: new Date().toISOString(),
+        action: "readonly",
+        targetIds: [],
+        count: state.readonlyMode ? 1 : 0,
+        status: "success",
+      });
+    }
+    return ok({
+      readonlyMode: state.readonlyMode,
+      changed: previous !== state.readonlyMode,
+      daemonBuildHash: BUILD_HASH,
+    });
+  }
+  if (isBlockedByReadonly(action, state)) {
+    return fail("readonly_mode", `${action} is blocked because RemNoteConnect read-only mode is enabled. Run readonly off to allow mutations.`, {
+      action,
+      readonlyMode: true,
     });
   }
   if (action === "reconfirmIrreversibleBudget") {
@@ -259,9 +300,22 @@ async function dispatchAction(
   }
   if (action === "doctor") {
     const bridgeStatus = bridge.status();
+    const warnings: string[] = [];
+    const buildMatch = bridgeStatus.connected && bridgeStatus.pluginBuildHash === BUILD_HASH;
+    if (bridgeStatus.connected && !buildMatch) {
+      warnings.push(
+        `Connected plugin build ${bridgeStatus.pluginBuildHash ?? "unknown"} does not match daemon build ${BUILD_HASH}; reload the RemNote local plugin bundle.`,
+      );
+    }
     const checks: Record<string, unknown> = {
       daemon: { ok: true, version: DAEMON_VERSION },
       bridge: bridgeStatus,
+      build: {
+        ok: buildMatch,
+        daemonBuildHash: BUILD_HASH,
+        pluginBuildHash: bridgeStatus.pluginBuildHash,
+        warning: bridgeStatus.connected && !buildMatch ? warnings[0] : undefined,
+      },
     };
     let okStatus = bridgeStatus.connected;
     if (bridgeStatus.connected) {
@@ -280,7 +334,7 @@ async function dispatchAction(
     } else {
       checks.scopeProbe = { ok: false, error: "plugin_disconnected" };
     }
-    return ok({ ok: okStatus, checks });
+    return ok({ ok: okStatus, checks, warnings, readonlyMode: state.readonlyMode });
   }
   if (action === "jobStatus") {
     const jobId = typeof params.jobId === "string" ? params.jobId : "";
@@ -527,6 +581,7 @@ export function buildServer(config: DaemonConfig): ServerBundle {
     dryRunHashes: new Set<string>(),
     irreversibleRemaining: IRREVERSIBLE_SESSION_BUDGET,
     startedAt: Date.now(),
+    readonlyMode: false,
   };
 
   app.server.on("upgrade", (request, socket, head) => {

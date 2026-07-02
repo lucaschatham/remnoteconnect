@@ -1,7 +1,10 @@
 import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1;
-export const DAEMON_VERSION = "0.2.0";
+export const REMNOTE_CONNECT_VERSION = "0.3.0";
+export const DAEMON_VERSION = REMNOTE_CONNECT_VERSION;
+export const PLUGIN_VERSION = REMNOTE_CONNECT_VERSION;
+export const BUILD_HASH = "ready-pilot-m1-20260702";
 export const DEFAULT_DAEMON_HOST = "127.0.0.1";
 export const DEFAULT_DAEMON_PORT = 8766;
 export const DEFAULT_DAEMON_URL = `http://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}`;
@@ -31,6 +34,7 @@ export type ErrorCode =
   | "dry_run_required"
   | "dry_run_mismatch"
   | "magnitude_guard"
+  | "readonly_mode"
   | "irreversible_budget_exceeded"
   | "forbidden_target"
   | "backup_failed"
@@ -60,6 +64,7 @@ export const PluginHelloSchema = z.object({
   type: z.literal("hello"),
   token: z.string().min(16),
   pluginVersion: z.string().optional(),
+  pluginBuildHash: z.string().optional(),
   transport: z.literal("websocket").default("websocket"),
   capabilities: z.record(z.unknown()).optional(),
 });
@@ -232,6 +237,21 @@ export const actionMetadata = {
     magnitudeGuarded: false,
     minimalReturn: "{bridge,jobs}",
     cliName: "metrics",
+    handler: "daemon",
+    implemented: true,
+  }),
+  readonly: action({
+    name: "readonly",
+    summary: "Toggle or inspect daemon-enforced read-only mode. While enabled, every mutating action is rejected before plugin dispatch.",
+    mutates: false,
+    reversible: true,
+    irreversible: false,
+    bulk: false,
+    retryable: true,
+    requiresDryRunHash: false,
+    magnitudeGuarded: false,
+    minimalReturn: "{readonlyMode}",
+    cliName: "readonly",
     handler: "daemon",
     implemented: true,
   }),
@@ -1255,6 +1275,7 @@ export const nativeActions = [
   "describe",
   "doctor",
   "metrics",
+  "readonly",
   "reconfirmIrreversibleBudget",
   "rotateToken",
   "multi",

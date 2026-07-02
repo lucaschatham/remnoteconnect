@@ -10,8 +10,14 @@ const label = "com.local.remnoteconnect.daemon";
 const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
 const appDir = join(homedir(), "Library", "Application Support", "RemNoteConnect");
 const runtimeDir = join(appDir, "runtime");
-const node = process.env.NODE_BIN ?? process.execPath;
+const node = process.env.NODE_BIN ?? defaultNodeBin();
 const guiTarget = `gui/${process.getuid?.() ?? ""}/${label}`;
+
+function defaultNodeBin() {
+  const found = spawnSync("/bin/zsh", ["-lc", "command -v node"], { encoding: "utf8" });
+  const path = found.status === 0 ? found.stdout.trim() : "";
+  return path || process.execPath;
+}
 
 function escapeXml(value) {
   return String(value)

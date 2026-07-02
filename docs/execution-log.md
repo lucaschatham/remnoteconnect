@@ -1,5 +1,46 @@
 # RemNoteConnect Execution Log
 
+## 2026-07-02 - M1 Ready-Pilot Safety And Visibility
+
+Shipped:
+
+- Bumped RemNoteConnect local build identity to `0.3.0` with build hash `ready-pilot-m1-20260702`.
+- Added daemon-enforced `readonly` mode plus CLI support: `node scripts/rnc.mjs readonly on|off|status`.
+- Added `readonly_mode` error handling and tests proving mutating plugin actions and daemon durable jobs are rejected before dispatch.
+- Added daemon/plugin build-hash handshake and `doctor` warnings for stale connected plugin bundles.
+- Added a visible plugin health panel showing bridge status, token presence, All-scope probe state, active jobs, heartbeat, and build match.
+- Added `scripts/static-redteam.mjs` and `check:redteam` for hard-delete path, read-only metadata, build-handshake, manifest-scope, token-scan, and externalId graph-pollution regressions.
+- Added `scripts/live-readonly.mjs` to verify read-only mode against the live RemNote bridge.
+- Updated `README.md` and `docs/INVARIANTS.md` for read-only mode, build mismatch warnings, and new verification gates.
+- Made daemon/plugin test scripts rebuild `shared` first so protocol-shape tests cannot accidentally run against stale shared dist output.
+
+Gate results so far:
+
+- `CI=true npx pnpm@11.7.0 -r typecheck` passed.
+- `CI=true npx pnpm@11.7.0 --filter @remnoteconnect/daemon test` passed: 27 daemon tests.
+- `CI=true npx pnpm@11.7.0 --filter @remnoteconnect/plugin test` passed: 16 plugin tests.
+- `CI=true npx pnpm@11.7.0 -r build` passed.
+- `CI=true npx pnpm@11.7.0 check:no-token` passed against rebuilt `plugin/dist`.
+- `CI=true npx pnpm@11.7.0 check:redteam` passed.
+
+Open validation before final ready-pilot tag:
+
+- Done: redeployed the rebuilt daemon/shared/plugin runtime into `~/Library/Application Support/RemNoteConnect/runtime`.
+- Done: restarted the LaunchAgent and restarted RemNote so the plugin reloaded from the served `0.3.0` bundle.
+- Done: `doctor` passed with daemon/plugin build hash match and no warnings.
+- Done: `live-readonly.mjs` passed; mutation failed with `readonly_mode` while read actions still worked.
+- Done: `live-scope.mjs`, `live-security.mjs`, `live-softdelete.mjs`, `live-docs.mjs`, `live-idempotent.mjs`, and `live-cleanup.mjs` passed.
+- Done: `chaos:daemon` passed in LaunchAgent mode after reconnect.
+- Done: residue sweep returned zero for `__codex_*` live-test markers and zero visible tombstones.
+- Done: final status reported `pluginVersion: 0.3.0`, matching build hash, `activeConnections: 1`, `pendingJobs: 0`, `readonlyMode: false`.
+- Done: irreversible session budget reset to 3 after live cleanup gates.
+- Done: LaunchAgent installer now prefers the stable `command -v node` path; current plist uses `/opt/homebrew/bin/node` instead of a versioned Cellar path.
+- Done: final `doctor` after reinstall/restart passed with no warnings.
+
+Validation caveat:
+
+- In this Codex non-interactive shell, pnpm's dependency verification attempted to purge/reinstall modules before some `pnpm run` commands. Restored the dev install with `CI=true npx pnpm@11.7.0 --config.confirmModulesPurge=false install --frozen-lockfile --prod=false`. Prefer direct `node scripts/*.mjs` for live gates when dependencies are already installed.
+
 ## 2026-07-02 - M0 Capability Probes
 
 Shipped:

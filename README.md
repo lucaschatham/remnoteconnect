@@ -9,6 +9,8 @@ Private local Mac bridge for controlling RemNote from terminal tools through an 
 - The plugin executes RemNote SDK reads/writes with whole-KB permission after RemNote approval.
 - HTTP callers use `{ "action": "...", "version": 1, "params": { ... } }`.
 - Destructive and bulk operations are dry-run-first. Soft delete moves Rem to `RemNoteConnect/Trash/<opId>` and writes a local undo record.
+- `readonly` mode lets an LLM inspect/search/map the graph while daemon-side guards reject every mutating action.
+- The plugin iframe shows bridge health, token presence, All-scope status, active jobs, heartbeat, and daemon/plugin build match.
 
 This is workflow parity with AnkiConnect, not literal Anki compatibility. Anki-only model/template/package APIs return stable `unsupported` errors.
 
@@ -74,8 +76,10 @@ CLI-first usage:
 
 ```sh
 node scripts/rnc.mjs describe
+node scripts/rnc.mjs readonly on
 node scripts/rnc.mjs map --depth 3
 node scripts/rnc.mjs search 'text:mitochondria'
+node scripts/rnc.mjs readonly off
 node scripts/rnc.mjs create-document --doc-spec ./doc.json --parent Inbox --confirm
 ```
 
@@ -122,7 +126,7 @@ Native actions:
 
 - `version`, `status`, `capabilities`, `multi`, `jobStatus`
 - `jobWait`, `confirmMaterialized`
-- `describe`, `doctor`, `metrics`, `scopeProbe`
+- `describe`, `doctor`, `metrics`, `readonly`, `scopeProbe`
 - `listRoots`, `createRem`, `createFolder`, `renameRem`, `moveRem`, `deleteRem`
 - `map`, `getRem`, `searchGraph`, `backupGraph`, `journalTail`, `undo`, `undoClear`, `emptyTrash`
 - `exportSubtree`, `importSnapshot`, `backupSubtree`, `validateSnapshot`
@@ -172,6 +176,8 @@ Structured document specs use compact rich text and nested children:
 - `emptyTrash` is the only hard-delete path. It requires a prior dry-run hash.
 - `backupGraph` is explicit and opt-in.
 - Snapshot restore recreates Rem as copies with new IDs. It does not preserve inbound references, portals, or scheduling history.
+- `readonly on` blocks every `mutates:true` action in the daemon before plugin dispatch.
+- `doctor` warns if the connected plugin build hash does not match the daemon build hash.
 
 ## Daily Driver
 
@@ -202,12 +208,20 @@ npx pnpm@11.7.0 --filter @remnoteconnect/plugin test
 npx pnpm@11.7.0 --filter @remnoteconnect/daemon test
 npx pnpm@11.7.0 -r build
 npx pnpm@11.7.0 check:no-token
+npx pnpm@11.7.0 check:redteam
+```
+
+In non-interactive shells, if pnpm asks to purge `node_modules`, restore/verify dependencies explicitly:
+
+```sh
+CI=true npx pnpm@11.7.0 --config.confirmModulesPurge=false install --frozen-lockfile --prod=false
 ```
 
 After RemNote has loaded `http://127.0.0.1:8080` and `node scripts/rnc.mjs doctor` is green:
 
 ```sh
 node scripts/live-security.mjs
+node scripts/live-readonly.mjs
 node scripts/live-scope.mjs
 node scripts/live-softdelete.mjs
 node scripts/live-docs.mjs

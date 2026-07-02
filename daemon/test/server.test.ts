@@ -6,7 +6,7 @@ import { WebSocket } from "ws";
 import { buildServer } from "../src/server.js";
 import { loadConfig } from "../src/config.js";
 import { startPluginStaticServer } from "../src/pluginStatic.js";
-import { IRREVERSIBLE_RECONFIRM_PHRASE } from "@remnoteconnect/shared";
+import { BUILD_HASH, IRREVERSIBLE_RECONFIRM_PHRASE } from "@remnoteconnect/shared";
 
 function testBundle() {
   const dir = mkdtempSync(join(tmpdir(), "remnote-connect-"));
@@ -29,7 +29,10 @@ async function listen(bundle: ReturnType<typeof testBundle>): Promise<number> {
   return address.port;
 }
 
-function connectPlugin(port: number, handlers: { onJob?: (message: { jobId: string; action: string; params: Record<string, unknown> }, ws: WebSocket) => void } = {}) {
+function connectPlugin(
+  port: number,
+  handlers: { onJob?: (message: { jobId: string; action: string; params: Record<string, unknown> }, ws: WebSocket) => void; pluginBuildHash?: string } = {},
+) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`, {
     headers: { origin: "http://127.0.0.1:8080" },
   });
@@ -40,6 +43,7 @@ function connectPlugin(port: number, handlers: { onJob?: (message: { jobId: stri
           type: "hello",
           token: "test-token-test-token",
           pluginVersion: "test",
+          pluginBuildHash: handlers.pluginBuildHash ?? BUILD_HASH,
           transport: "websocket",
           capabilities: { test: true },
         }),
@@ -198,6 +202,111 @@ describe("daemon server", () => {
       payload: { action: "updateDocument", version: 1, params: {} },
     });
     expect(planned.json().error.code).toBe("not_implemented");
+  });
+
+  it("toggles daemon-enforced read-only mode and blocks mutating plugin actions before dispatch", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    const seenActions: string[] = [];
+    const { ws, ready } = connectPlugin(port, {
+      onJob(message, socket) {
+        seenActions.push(message.action);
+        socket.send(JSON.stringify({ type: "result", jobId: message.jobId, result: { count: 0, ids: [] }, error: null }));
+      },
+    });
+    await ready;
+
+    const enabled = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "readonly", version: 1, params: { mode: "on" } },
+    });
+    expect(enabled.json().result).toMatchObject({ readonlyMode: true, changed: true });
+
+    const status = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "status", version: 1 },
+    });
+    expect(status.json().result.readonlyMode).toBe(true);
+
+    const read = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "searchGraph", version: 1, params: { query: "text:noop" } },
+    });
+    expect(read.json().error).toBeNull();
+    expect(seenActions).toEqual(["searchGraph"]);
+
+    const blockedPluginMutation = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "createFlashcard", version: 1, params: { front: "A", back: "B" } },
+    });
+    expect(blockedPluginMutation.json().error.code).toBe("readonly_mode");
+
+    const blockedDaemonMutation = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "createFlashcardsAsync", version: 1, params: { cards: [{ front: "A", back: "B" }], confirm: true } },
+    });
+    expect(blockedDaemonMutation.json().error.code).toBe("readonly_mode");
+    expect(seenActions).toEqual(["searchGraph"]);
+
+    const disabled = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "readonly", version: 1, params: { mode: "off" } },
+    });
+    expect(disabled.json().result).toMatchObject({ readonlyMode: false, changed: true });
+
+    const mutationAfterDisable = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "createFlashcard", version: 1, params: { front: "A", back: "B" } },
+    });
+    expect(mutationAfterDisable.json().error).toBeNull();
+    expect(seenActions).toEqual(["searchGraph", "createFlashcard"]);
+    ws.close();
+    await bundle.app.close();
+  });
+
+  it("warns when the connected plugin build does not match the daemon build", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    const { ws, ready } = connectPlugin(port, {
+      pluginBuildHash: "stale-plugin-build",
+      onJob(message, socket) {
+        expect(message.action).toBe("scopeProbe");
+        socket.send(JSON.stringify({ type: "result", jobId: message.jobId, result: { ok: true }, error: null }));
+      },
+    });
+    await ready;
+
+    const doctor = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "doctor", version: 1 },
+    });
+    expect(doctor.json().result.ok).toBe(true);
+    expect(doctor.json().result.warnings[0]).toContain("stale-plugin-build");
+    expect(doctor.json().result.checks.build).toMatchObject({
+      ok: false,
+      daemonBuildHash: BUILD_HASH,
+      pluginBuildHash: "stale-plugin-build",
+    });
+    ws.close();
+    await bundle.app.close();
   });
 
   it("reports plugin disconnected for plugin actions", async () => {

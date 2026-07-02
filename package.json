@@ -1,7 +1,7 @@
 {
   "name": "remnote-connect",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Private local RemNote bridge with an AnkiConnect-inspired API.",
   "type": "module",
   "packageManager": "pnpm@11.7.0",
@@ -23,6 +23,7 @@
     "live:docs": "node scripts/live-docs.mjs",
     "live:anki-probes": "node scripts/live-anki-migration-probes.mjs",
     "live:cardtypes": "node scripts/live-cardtypes.mjs",
+    "live:readonly": "node scripts/live-readonly.mjs",
     "probe:capabilities": "node scripts/probe-capabilities.mjs",
     "live:cleanup": "node scripts/live-cleanup.mjs",
     "live:idempotent": "node scripts/live-idempotent.mjs",
@@ -33,7 +34,8 @@
     "launch-agent:install": "node scripts/install-launch-agent.mjs install",
     "launch-agent:check": "node scripts/install-launch-agent.mjs check",
     "launch-agent:uninstall": "node scripts/install-launch-agent.mjs uninstall",
-    "check:no-token": "node scripts/check-no-token.mjs"
+    "check:no-token": "node scripts/check-no-token.mjs",
+    "check:redteam": "node scripts/static-redteam.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",

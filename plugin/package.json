@@ -1,13 +1,13 @@
 {
   "name": "@remnoteconnect/plugin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "vite build && tsc -p tsconfig.json --noEmit",
     "typecheck": "pnpm --filter @remnoteconnect/shared build && tsc -p tsconfig.json --noEmit",
     "dev": "pnpm --filter @remnoteconnect/shared build && vite --host 127.0.0.1 --port 8080",
-    "test": "vitest run"
+    "test": "pnpm --filter @remnoteconnect/shared build && vitest run"
   },
   "dependencies": {
     "@remnote/plugin-sdk": "0.0.46",

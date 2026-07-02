@@ -15,6 +15,8 @@ The load-bearing invariant is reversibility before capability:
 
 The operational root `RemNoteConnect` still exists for bridge-owned folders such as `Trash` and `Tags`, but graph operations may target Rem outside that root.
 
+Read-only mode is daemon-enforced. When `readonly` is on, every action marked `mutates:true` in shared action metadata must fail with `readonly_mode` before it reaches the plugin or durable job queue. Read-only mode is for audit, mapping, and LLM inspection sessions; it is not a substitute for undo on write sessions.
+
 ## Audit And Undo
 
 Audit and undo are separate artifacts.
@@ -41,6 +43,8 @@ No code path may call `rem.remove()` except the `emptyTrash` implementation.
 Do not assume RemNote approved the expanded scope. `doctor` must run `scopeProbe`, which uses `plugin.rem.getAll()` and verifies that the plugin can see at least one Rem outside the operational root.
 
 If the user has not approved `All / ReadCreateModifyDelete`, `doctor` must report the failed scope probe clearly.
+
+Do not assume the connected plugin is the currently built plugin. The plugin must report `pluginBuildHash` during the bridge handshake, and `doctor` must warn when it differs from the daemon build hash.
 
 ## Token Handling
 
