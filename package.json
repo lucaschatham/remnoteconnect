@@ -25,6 +25,7 @@
     "live:cardtypes": "node scripts/live-cardtypes.mjs",
     "live:readonly": "node scripts/live-readonly.mjs",
     "probe:capabilities": "node scripts/probe-capabilities.mjs",
+    "pilot:audit": "node scripts/pilot-audit.mjs",
     "live:cleanup": "node scripts/live-cleanup.mjs",
     "live:idempotent": "node scripts/live-idempotent.mjs",
     "live:scheduler": "node scripts/scheduler-smoke.mjs",
