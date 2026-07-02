@@ -14,6 +14,7 @@ function usage() {
   rnc doctor
   rnc status
   rnc metrics
+  rnc capability-probes [--confirm]
   rnc reconfirm-irreversible --phrase "I understand irreversible RemNote operations cannot be undone" --confirm
   rnc rotate-token
   rnc map --depth 3 [--root-id ID]
@@ -38,6 +39,7 @@ function usage() {
   rnc confirm-materialized --job-id JOB_ID
   rnc undo OP_ID
   rnc journal-tail [N]
+  rnc list-tombstones
   rnc backup-graph
   rnc empty-trash [--from-dry-run HASH] [--confirm] [--confirm-count N]
 
@@ -138,6 +140,8 @@ async function main() {
   let result;
   if (command === "describe" || command === "doctor" || command === "status" || command === "metrics") {
     result = await call(command, commonParams(flags));
+  } else if (command === "capability-probes") {
+    result = await call("capabilityProbes", { ...commonParams(flags), runId: flags.runId });
   } else if (command === "reconfirm-irreversible") {
     result = await call("reconfirmIrreversibleBudget", { ...commonParams(flags), phrase: flags.phrase });
   } else if (command === "rotate-token") {
@@ -259,6 +263,8 @@ async function main() {
     result = await call("undo", { opId });
   } else if (command === "journal-tail") {
     result = await call("journalTail", { n: Number(args[1] ?? flags.n ?? 50) });
+  } else if (command === "list-tombstones") {
+    result = await call("listTombstones", commonParams(flags));
   } else if (command === "backup-graph") {
     result = await call("backupGraph", commonParams(flags));
   } else if (command === "empty-trash") {

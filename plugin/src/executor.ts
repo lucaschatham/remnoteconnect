@@ -781,6 +781,83 @@ function isClozeCardType(type: unknown): boolean {
   return type !== "forward" && type !== "backward";
 }
 
+type CapabilityStatus = "PASS" | "FAIL" | "UNSUPPORTED";
+
+type CapabilityProbeRow = {
+  capability: string;
+  status: CapabilityStatus;
+  method: string;
+  details?: unknown;
+  workaround?: string;
+  error?: Record<string, unknown>;
+};
+
+function probeRow(
+  capability: string,
+  status: CapabilityStatus,
+  method: string,
+  extras: Omit<CapabilityProbeRow, "capability" | "status" | "method"> = {},
+): CapabilityProbeRow {
+  return { capability, status, method, ...extras };
+}
+
+async function probeCards(rem: RemObject, timeoutMs = 5000): Promise<Awaited<ReturnType<typeof summarizeCard>>[]> {
+  await waitForCards(rem, timeoutMs);
+  return Promise.all((await rem.getCards()).map(summarizeCard));
+}
+
+async function probeMarkdownCardSyntax(
+  plugin: ReactRNPlugin,
+  parent: RemObject,
+  capability: string,
+  method: string,
+  markdown: string,
+  timeoutMs = 5000,
+): Promise<CapabilityProbeRow> {
+  try {
+    const rems = await plugin.rem.createTreeWithMarkdown(markdown, parent._id);
+    const nested = await Promise.all(rems.map((rem) => rem.getDescendants()));
+    const created = [...rems, ...nested.flat()];
+    const cardRows = await Promise.all(
+      created.map(async (rem) => ({
+        remId: rem._id,
+        text: await richTextToString(plugin, rem.text),
+        cards: await probeCards(rem, timeoutMs),
+        isCardItem: await rem.isCardItem(),
+      })),
+    );
+    const cardCount = cardRows.reduce((count, row) => count + row.cards.length, 0);
+    return probeRow(capability, cardCount > 0 ? "PASS" : "FAIL", method, {
+      details: {
+        createdCount: created.length,
+        cardCount,
+        cardTypes: cardRows.flatMap((row) => row.cards.map((card) => card.type)),
+        cardItemCount: cardRows.filter((row) => row.isCardItem).length,
+        rows: cardRows,
+      },
+      workaround: cardCount > 0 ? undefined : "Fallback to explicit Rem SDK calls or user-assisted RemNote paste/import syntax.",
+    });
+  } catch (error) {
+    return probeRow(capability, "FAIL", method, { error: publicError(error) });
+  }
+}
+
+function methodNames(value: unknown, pattern?: RegExp): string[] {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return [];
+  const names = new Set<string>();
+  let current: unknown = value;
+  while (current && (typeof current === "object" || typeof current === "function")) {
+    for (const key of Object.getOwnPropertyNames(current)) {
+      if (key === "constructor") continue;
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      const member = descriptor?.value;
+      if (typeof member === "function" && (!pattern || pattern.test(key))) names.add(key);
+    }
+    current = Object.getPrototypeOf(current);
+  }
+  return [...names].sort();
+}
+
 async function createProbeRem(plugin: ReactRNPlugin, parent: RemObject, text: string): Promise<RemObject> {
   const rem = await plugin.rem.createRem();
   if (!rem) throw new Error("RemNote did not return a Rem from createRem.");
@@ -802,6 +879,265 @@ async function richTextProbeRead(plugin: ReactRNPlugin, rem: RemObject): Promise
         markdown: item.text ? await plugin.richText.toMarkdown(item.text).catch((error: unknown) => `toMarkdown error: ${publicError(error).message}`) : "",
       })),
     ),
+  };
+}
+
+async function runCapabilityProbes(plugin: ReactRNPlugin, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const runId = str(params.runId) ?? `__codex_probe__-${Date.now().toString(36)}`;
+  if (params.dryRun === true || params.confirm !== true) {
+    return {
+      dryRun: true,
+      runId,
+      probes: [
+        "front/back card",
+        "concept card",
+        "descriptor card",
+        "cloze card",
+        "multi-line/list card",
+        "image occlusion scriptability",
+        "properties",
+        "portals",
+        "ordered insertion",
+        "native trash",
+        "drift primitives",
+        "media data URI",
+      ],
+      warning: "capabilityProbes creates disposable __codex_probe__ Rems and tombstones them. Pass confirm:true to execute.",
+    };
+  }
+
+  const parent = await ensurePath(plugin, runId, MANAGED_ROOT_NAME, { finalAsFolder: true });
+  const capabilities: CapabilityProbeRow[] = [];
+  const materializeTimeoutMs = Math.max(0, Number(params.materializeTimeoutMs ?? 5000));
+
+  try {
+    const rem = await createProbeRem(plugin, parent, `${runId} front/back prompt`);
+    await rem.setBackText(await toRichText(plugin, `${runId} front/back answer`));
+    await rem.setEnablePractice(true);
+    await rem.setPracticeDirection("forward");
+    const cards = await probeCards(rem, materializeTimeoutMs);
+    capabilities.push(
+      probeRow("frontBackCard", cards.length > 0 ? "PASS" : "FAIL", "rem.setText + rem.setBackText + rem.setEnablePractice + rem.setPracticeDirection", {
+        details: { remId: rem._id, cardCount: cards.length, cardTypes: cards.map((card) => card.type), cards },
+      }),
+    );
+  } catch (error) {
+    capabilities.push(probeRow("frontBackCard", "FAIL", "rem.setText + rem.setBackText", { error: publicError(error) }));
+  }
+
+  capabilities.push(
+    await probeMarkdownCardSyntax(
+      plugin,
+      parent,
+      "conceptCard",
+      "plugin.rem.createTreeWithMarkdown using RemNote concept delimiter ::",
+      `- ${runId} Concept :: ${runId} definition`,
+      materializeTimeoutMs,
+    ),
+  );
+
+  capabilities.push(
+    await probeMarkdownCardSyntax(
+      plugin,
+      parent,
+      "descriptorCard",
+      "plugin.rem.createTreeWithMarkdown using RemNote descriptor delimiter ;;",
+      `- ${runId} Parent Concept\n  - attribute ;; ${runId} descriptor answer`,
+      materializeTimeoutMs,
+    ),
+  );
+
+  try {
+    const cloze = await createProbeRem(plugin, parent, `${runId} cloze alpha beta gamma`);
+    const plain = `${runId} cloze alpha beta gamma`;
+    let richText = await toRichText(plugin, plain);
+    const start = plain.indexOf("alpha");
+    richText = await plugin.richText.applyTextFormatToRange(richText, start, start + "alpha".length, "cloze");
+    await cloze.setText(richText);
+    await cloze.setEnablePractice(true);
+    const cards = await probeCards(cloze, materializeTimeoutMs);
+    const clozeCards = cards.filter((card) => isClozeCardType(card.type));
+    capabilities.push(
+      probeRow("clozeCard", clozeCards.length > 0 ? "PASS" : "FAIL", "richText.applyTextFormatToRange(..., 'cloze') + rem.setEnablePractice", {
+        details: { remId: cloze._id, cardCount: cards.length, clozeCount: clozeCards.length, cardTypes: cards.map((card) => card.type), cards },
+      }),
+    );
+  } catch (error) {
+    capabilities.push(probeRow("clozeCard", "FAIL", "richText.applyTextFormatToRange(..., 'cloze')", { error: publicError(error) }));
+  }
+
+  capabilities.push(
+    await probeMarkdownCardSyntax(
+      plugin,
+      parent,
+      "multiLineCard",
+      "plugin.rem.createTreeWithMarkdown using RemNote multi-line delimiter >>>",
+      `- ${runId} multi-line prompt >>>\n  - ${runId} item one\n  - ${runId} item two`,
+      materializeTimeoutMs,
+    ),
+  );
+
+  capabilities.push(
+    await probeMarkdownCardSyntax(
+      plugin,
+      parent,
+      "listAnswerCard",
+      "plugin.rem.createTreeWithMarkdown using RemNote list-answer delimiter >>1.",
+      `- ${runId} list prompt >>1.\n  - ${runId} first\n  - ${runId} second`,
+      materializeTimeoutMs,
+    ),
+  );
+
+  const pluginAny = plugin as unknown as Record<string, unknown>;
+  const imageOcclusionMethods = [
+    ...methodNames(pluginAny, /occlusion|imageOcclusion/i),
+    ...methodNames(pluginAny.richText, /occlusion|imageOcclusion/i),
+    ...methodNames(pluginAny.app, /occlusion|imageOcclusion/i),
+  ];
+  capabilities.push(
+    imageOcclusionMethods.length > 0
+      ? probeRow("imageOcclusion", "PASS", imageOcclusionMethods.join(", "), {
+          details: { methods: imageOcclusionMethods },
+          workaround: "Presence of a method does not prove full card authoring; add a dedicated visual probe before using on real content.",
+        })
+      : probeRow("imageOcclusion", "UNSUPPORTED", "SDK method introspection", {
+          details: { methods: [] },
+          workaround: "Use RemNote's native UI for image occlusion or store images/context for user-assisted occlusion until the SDK exposes a scriptable API.",
+        }),
+  );
+
+  try {
+    const rem = await createProbeRem(plugin, parent, `${runId} property probe`);
+    await rem.addPowerup("b");
+    await rem.setPowerupProperty("b", "URL", await toRichText(plugin, `https://example.com/${runId}`));
+    const value = await richTextToString(plugin, await rem.getPowerupPropertyAsRichText("b", "URL"));
+    capabilities.push(
+      probeRow("properties", value.includes(runId) ? "PASS" : "FAIL", "rem.addPowerup + rem.setPowerupProperty + rem.getPowerupPropertyAsRichText", {
+        details: { remId: rem._id, value },
+      }),
+    );
+  } catch (error) {
+    capabilities.push(probeRow("properties", "FAIL", "rem.addPowerup + powerup property methods", { error: publicError(error) }));
+  }
+
+  try {
+    const included = await createProbeRem(plugin, parent, `${runId} portal included`);
+    const host = await createProbeRem(plugin, parent, `${runId} portal host`);
+    await included.addToPortal(host);
+    capabilities.push(
+      probeRow("portals", "PASS", "rem.addToPortal", {
+        details: { includedRemId: included._id, portalHostRemId: host._id, caveat: "Probe verifies SDK call succeeds, not visual portal rendering." },
+      }),
+    );
+  } catch (error) {
+    capabilities.push(probeRow("portals", "FAIL", "rem.addToPortal", { error: publicError(error) }));
+  }
+
+  try {
+    const orderParent = await createProbeRem(plugin, parent, `${runId} ordered parent`);
+    const first = await createProbeRem(plugin, orderParent, `${runId} first`);
+    const second = await createProbeRem(plugin, orderParent, `${runId} second`);
+    const moved = await createProbeRem(plugin, orderParent, `${runId} moved`);
+    await moved.setParent(orderParent, 1);
+    const order = (await orderParent.getChildrenRem()).map((rem) => rem._id);
+    capabilities.push(
+      probeRow("orderedInsertion", order[0] === first._id && order[1] === moved._id && order[2] === second._id ? "PASS" : "FAIL", "rem.setParent(parent, positionAmongstSiblings)", {
+        details: { expected: [first._id, moved._id, second._id], observed: order },
+      }),
+    );
+  } catch (error) {
+    capabilities.push(probeRow("orderedInsertion", "FAIL", "rem.setParent(parent, positionAmongstSiblings)", { error: publicError(error) }));
+  }
+
+  const nativeTrashMethods = [
+    ...methodNames(parent, /trash|restore/i),
+    ...methodNames(pluginAny.rem, /trash|restore/i),
+    ...methodNames(pluginAny.app, /trash|restore/i),
+  ];
+  capabilities.push(
+    nativeTrashMethods.length > 0
+      ? probeRow("nativeTrashRestore", "PASS", nativeTrashMethods.join(", "), {
+          details: { methods: nativeTrashMethods },
+          workaround: "Verify ID-preserving behavior before using; tombstone-by-move remains the safe default.",
+        })
+      : probeRow("nativeTrashRestore", "UNSUPPORTED", "SDK method introspection", {
+          details: { methods: nativeTrashMethods },
+          workaround: "Continue tombstone-by-move; snapshot restore is copy-only and not true undo.",
+        }),
+  );
+
+  try {
+    const driftRem = await createProbeRem(plugin, parent, `${runId} drift probe`);
+    const before = driftRem.updatedAt;
+    await sleep(5);
+    await driftRem.setText(await toRichText(plugin, `${runId} drift changed`));
+    const after = driftRem.updatedAt;
+    const changeFeedMethods = [
+      ...methodNames(pluginAny.rem, /change|event|listen|subscribe|watch|sync/i),
+      ...methodNames(pluginAny.app, /change|event|listen|subscribe|watch|sync/i),
+      ...methodNames(pluginAny, /change|event|listen|subscribe|watch|sync/i),
+    ];
+    capabilities.push(
+      probeRow("driftPrimitives", before !== undefined && after !== undefined ? "PASS" : "FAIL", "rem.updatedAt + SDK method introspection", {
+        details: {
+          createdAtType: typeof driftRem.createdAt,
+          updatedAtType: typeof driftRem.updatedAt,
+          updatedAtChanged: before !== after,
+          contentHashField: "contentHash" in (driftRem as unknown as Record<string, unknown>),
+          changeFeedMethods,
+        },
+        workaround: changeFeedMethods.length > 0 ? undefined : "Use chunked getAll snapshot sweeps and content hashes for drift detection.",
+      }),
+    );
+  } catch (error) {
+    capabilities.push(probeRow("driftPrimitives", "FAIL", "rem.updatedAt + SDK method introspection", { error: publicError(error) }));
+  }
+
+  try {
+    const dataUri =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    const richText = await plugin.richText.image(dataUri).value();
+    const rem = await createProbeRem(plugin, parent, `${runId} media probe`);
+    await rem.setText(richText);
+    const richTextApi = plugin.richText as unknown as {
+      toHTML?: (richText: RichTextInterface) => Promise<string>;
+      findAllExternalURLs?: (richText: RichTextInterface) => Promise<string[]>;
+    };
+    const html = richTextApi.toHTML ? await richTextApi.toHTML(richText) : undefined;
+    const urls = richTextApi.findAllExternalURLs ? await richTextApi.findAllExternalURLs(richText) : undefined;
+    const text = await richTextToString(plugin, rem.text);
+    capabilities.push(
+      probeRow("mediaDataUriImage", text.includes("data:image") || html?.includes("data:image") || urls?.some((url) => url.includes("data:image")) ? "PASS" : "FAIL", "richText.image(dataUri) + setText + optional toHTML/findAllExternalURLs", {
+        details: { remId: rem._id, text, html, urls },
+      }),
+    );
+  } catch (error) {
+    capabilities.push(probeRow("mediaDataUriImage", "FAIL", "richText.image(dataUri)", { error: publicError(error) }));
+  }
+
+  const opId = `${runId}-tombstone`;
+  const undoRecord = await captureUndoRecord("capabilityProbes", opId, [parent]);
+  const trash = await trashFolder(plugin, opId);
+  await parent.setParent(trash);
+  const failures = capabilities.filter((row) => row.status === "FAIL");
+
+  return {
+    ok: failures.length === 0,
+    runId,
+    generatedAt: new Date().toISOString(),
+    sdkVersion: "@remnote/plugin-sdk@0.0.46",
+    capabilities,
+    summary: {
+      pass: capabilities.filter((row) => row.status === "PASS").length,
+      fail: failures.length,
+      unsupported: capabilities.filter((row) => row.status === "UNSUPPORTED").length,
+    },
+    cleanup: {
+      mode: "soft-delete",
+      opId,
+      tombstoneParentId: trash._id,
+    },
+    undoRecord,
   };
 }
 
@@ -990,6 +1326,8 @@ export async function executeAction(
         },
       };
     }
+    case "capabilityProbes":
+      return runCapabilityProbes(plugin, params);
     case "ankiMigrationProbes":
       return runAnkiMigrationProbes(plugin, params);
     case "listRoots": {

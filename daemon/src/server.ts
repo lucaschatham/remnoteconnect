@@ -72,6 +72,7 @@ function pluginActionTimeout(action: string, params: Record<string, unknown>): n
     const items = Array.isArray(params.cards) ? params.cards : Array.isArray(params.notes) ? params.notes : [];
     return Math.max(120_000, items.length * 1_000);
   }
+  if (action === "capabilityProbes") return 120_000;
   return 30_000;
 }
 

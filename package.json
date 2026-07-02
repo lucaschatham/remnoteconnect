@@ -22,6 +22,8 @@
     "live:softdelete": "node scripts/live-softdelete.mjs",
     "live:docs": "node scripts/live-docs.mjs",
     "live:anki-probes": "node scripts/live-anki-migration-probes.mjs",
+    "live:cardtypes": "node scripts/live-cardtypes.mjs",
+    "probe:capabilities": "node scripts/probe-capabilities.mjs",
     "live:cleanup": "node scripts/live-cleanup.mjs",
     "live:idempotent": "node scripts/live-idempotent.mjs",
     "live:scheduler": "node scripts/scheduler-smoke.mjs",

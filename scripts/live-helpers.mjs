@@ -52,6 +52,19 @@ export async function hardDeleteTestIds(ids, opId) {
   }
 }
 
+export async function emptyTrashOpId(opId) {
+  if (!opId) return;
+  const dryRun = await call("emptyTrash", { opId });
+  if ((dryRun.count ?? 0) === 0) return;
+  try {
+    await call("emptyTrash", { opId, confirm: true, fromDryRun: dryRun.fromDryRun, confirmCount: dryRun.count });
+  } catch (error) {
+    if (error?.details?.code !== "irreversible_budget_exceeded") throw error;
+    await call("reconfirmIrreversibleBudget", { confirm: true, phrase: irreversibleReconfirmPhrase });
+    await call("emptyTrash", { opId, confirm: true, fromDryRun: dryRun.fromDryRun, confirmCount: dryRun.count });
+  }
+}
+
 export async function cleanupByText(runId) {
   try {
     const residue = await call("searchGraph", { query: `text:"${runId}"` });

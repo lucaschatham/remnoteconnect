@@ -44,6 +44,36 @@ describe("plugin executor", () => {
     expect(summary.tags.map((tag) => tag.text)).toContain("tag-a");
   });
 
+  it("runs capability probes with explicit unsupported rows and tombstone cleanup metadata", async () => {
+    const graph = new FakeRemGraph();
+    const dryRun = (await executeAction(graph.plugin, "capabilityProbes", { runId: "__codex_probe__unit" })) as {
+      dryRun: boolean;
+      probes: string[];
+    };
+    expect(dryRun.dryRun).toBe(true);
+    expect(dryRun.probes).toContain("image occlusion scriptability");
+
+    const result = (await executeAction(graph.plugin, "capabilityProbes", {
+      runId: "__codex_probe__unit",
+      confirm: true,
+      materializeTimeoutMs: 0,
+    })) as {
+      runId: string;
+      capabilities: Array<{ capability: string; status: string }>;
+      cleanup: { opId: string; tombstoneParentId: string };
+      undoRecord: unknown;
+    };
+
+    expect(result.runId).toBe("__codex_probe__unit");
+    expect(result.capabilities.map((row) => row.capability)).toEqual(
+      expect.arrayContaining(["frontBackCard", "imageOcclusion", "orderedInsertion", "driftPrimitives"]),
+    );
+    expect(result.capabilities.find((row) => row.capability === "imageOcclusion")?.status).toBe("UNSUPPORTED");
+    expect(result.cleanup.opId).toBe("__codex_probe__unit-tombstone");
+    const tombstones = (await executeAction(graph.plugin, "listTombstones", {})) as { count: number };
+    expect(tombstones.count).toBe(1);
+  });
+
   it("bulk create is compact by default but can return verbose materialization data", async () => {
     const graph = new FakeRemGraph();
     graph.cardMaterializeAfterReads = 10;
