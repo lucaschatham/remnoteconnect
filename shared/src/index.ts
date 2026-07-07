@@ -27,6 +27,7 @@ export type ErrorCode =
   | "plugin_disconnected"
   | "plugin_reconnected"
   | "timeout"
+  | "aborted"
   | "unsupported"
   | "not_implemented"
   | "not_found"
@@ -950,7 +951,7 @@ export const actionMetadata = {
   }),
   appendToDocument: action({
     name: "appendToDocument",
-    summary: "Append Markdown under an existing document Rem.",
+    summary: "Append Markdown or structured docSpec under an existing document Rem.",
     mutates: true,
     reversible: true,
     irreversible: false,
@@ -1118,6 +1119,20 @@ export const actionMetadata = {
     magnitudeGuarded: true,
     minimalReturn: "{opId,count}",
     cliName: "normalize-text",
+    handler: "plugin",
+    implemented: true,
+  }),
+  rewriteNativeLinks: action({
+    name: "rewriteNativeLinks",
+    summary: "Rewrite verified source-child raw links into native Rem references. Dry-run and count guarded.",
+    mutates: true,
+    reversible: true,
+    irreversible: false,
+    bulk: true,
+    requiresDryRunHash: false,
+    magnitudeGuarded: true,
+    minimalReturn: "{opId,count,remIds}",
+    cliName: "rewrite-native-links",
     handler: "plugin",
     implemented: true,
   }),
@@ -1325,6 +1340,7 @@ export const nativeActions = [
   "findOrphans",
   "findEmpty",
   "normalizeText",
+  "rewriteNativeLinks",
   "bulkRetag",
   "bulkMove",
   "createFlashcardsAsync",

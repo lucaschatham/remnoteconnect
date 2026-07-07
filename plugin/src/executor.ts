@@ -115,6 +115,19 @@ function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = 0;
+  while (index < haystack.length) {
+    const found = haystack.indexOf(needle, index);
+    if (found === -1) break;
+    count += 1;
+    index = found + Math.max(1, needle.length);
+  }
+  return count;
+}
+
 function firstMarkdownTitle(markdown: string): string {
   const line = markdown
     .split("\n")
@@ -333,6 +346,292 @@ async function normalizeTextRems(plugin: ReactRNPlugin, params: Record<string, u
     if (includeBackText) await rem.setBackText(await toRichText(plugin, normalizeWhitespace(await richTextToString(plugin, rem.backText))));
   }
   return { opId, count: targets.length, remIds: targets.map((rem) => rem._id), undoRecord };
+}
+
+type NativeLinkCandidate = {
+  sourceNodeId?: string;
+  nodeId?: string;
+  targetRemId?: string;
+  raw?: string;
+  sourcePath?: string;
+  targetPath?: string;
+  line?: number;
+};
+
+type NativeLinkReady = {
+  ok: true;
+  source: RemObject;
+  target: RemObject;
+  raw: string;
+  field: "text" | "backText";
+  sourceNodeId: string;
+  targetRemId: string;
+  sourcePath?: string;
+  targetPath?: string;
+  line?: number;
+};
+
+type NativeLinkBlocked = {
+  ok: false;
+  reason: string;
+  sourceNodeId?: string;
+  targetRemId?: string;
+  raw?: string;
+  sourcePath?: string;
+  targetPath?: string;
+  line?: number;
+};
+
+function richTextParts(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [value];
+}
+
+function replaceInTextNode(
+  text: string,
+  raw: string,
+  replacement: RichTextInterface,
+  makeTextPart: (text: string) => unknown,
+): { parts: unknown[]; count: number } {
+  const parts: unknown[] = [];
+  let count = 0;
+  let cursor = 0;
+  while (true) {
+    const index = text.indexOf(raw, cursor);
+    if (index === -1) break;
+    const before = text.slice(cursor, index);
+    if (before) parts.push(makeTextPart(before));
+    parts.push(...richTextParts(replacement));
+    count += 1;
+    cursor = index + raw.length;
+  }
+  if (count === 0) return { parts: [makeTextPart(text)], count: 0 };
+  const after = text.slice(cursor);
+  if (after) parts.push(makeTextPart(after));
+  return { parts, count };
+}
+
+function replaceRawTextDirect(input: RichTextInterface, raw: string, replacement: RichTextInterface): { value: RichTextInterface; count: number } {
+  let count = 0;
+  const visit = (node: unknown): unknown[] => {
+    if (typeof node === "string") {
+      const replaced = replaceInTextNode(node, raw, replacement, (text) => text);
+      count += replaced.count;
+      return replaced.parts;
+    }
+    if (Array.isArray(node)) {
+      const parts: unknown[] = [];
+      for (const child of node) parts.push(...visit(child));
+      return parts;
+    }
+    if (!node || typeof node !== "object") return [node];
+
+    const record = node as Record<string, unknown>;
+    for (const key of ["text", "plainText", "value"]) {
+      if (typeof record[key] === "string" && record[key].includes(raw)) {
+        const replaced = replaceInTextNode(record[key] as string, raw, replacement, (text) => ({ ...record, [key]: text }));
+        count += replaced.count;
+        return replaced.parts;
+      }
+    }
+    for (const key of ["content", "children", "segments", "richText"]) {
+      if (Array.isArray(record[key])) {
+        const before = count;
+        const children: unknown[] = [];
+        for (const child of record[key] as unknown[]) children.push(...visit(child));
+        if (count !== before) return [{ ...record, [key]: children }];
+      }
+    }
+    return [node];
+  };
+
+  const output = visit(input);
+  return {
+    value: (Array.isArray(input) ? output : output.length === 1 ? output[0] : output) as RichTextInterface,
+    count,
+  };
+}
+
+async function replaceRawLinkRichText(
+  plugin: ReactRNPlugin,
+  input: RichTextInterface,
+  raw: string,
+  replacement: RichTextInterface,
+): Promise<RichTextInterface> {
+  const direct = replaceRawTextDirect(input, raw, replacement);
+  if (direct.count === 1) return direct.value;
+  const from = await plugin.richText.text(raw).value();
+  return plugin.richText.replaceAllRichText(input, from, replacement);
+}
+
+function nativeLinkCandidateCommon(value: unknown): NativeLinkBlocked & {
+  sourceNodeId?: string;
+  targetRemId?: string;
+  raw?: string;
+} {
+  const candidate = asRecord(value) as NativeLinkCandidate;
+  const sourceNodeId = str(candidate.sourceNodeId) ?? str(candidate.nodeId);
+  const targetRemId = str(candidate.targetRemId);
+  const raw = str(candidate.raw);
+  return {
+    ok: false,
+    reason: "",
+    sourceNodeId,
+    targetRemId,
+    raw,
+    sourcePath: str(candidate.sourcePath),
+    targetPath: str(candidate.targetPath),
+    line: typeof candidate.line === "number" ? candidate.line : undefined,
+  };
+}
+
+async function evaluateNativeLinkCandidates(plugin: ReactRNPlugin, input: unknown[]): Promise<Array<NativeLinkReady | NativeLinkBlocked>> {
+  const parsed = input.map(nativeLinkCandidateCommon);
+  const immediate: NativeLinkBlocked[] = parsed
+    .filter((candidate) => !candidate.sourceNodeId || !candidate.targetRemId || !candidate.raw)
+    .map((candidate) => ({ ...candidate, reason: "missing-required-field" }));
+  const valid = parsed.filter(
+    (candidate): candidate is NativeLinkBlocked & { sourceNodeId: string; targetRemId: string; raw: string } =>
+      Boolean(candidate.sourceNodeId && candidate.targetRemId && candidate.raw),
+  );
+  const sourceIds = [...new Set(valid.map((candidate) => candidate.sourceNodeId))];
+  const targetIds = [...new Set(valid.map((candidate) => candidate.targetRemId))];
+  const sources = new Map<string, RemObject | undefined>();
+  const targets = new Map<string, RemObject | undefined>();
+  for (const id of sourceIds) sources.set(id, await plugin.rem.findOne(id));
+  for (const id of targetIds) targets.set(id, await plugin.rem.findOne(id));
+
+  const bySource = new Map<string, Array<NativeLinkBlocked & { sourceNodeId: string; targetRemId: string; raw: string }>>();
+  for (const candidate of valid) {
+    const source = sources.get(candidate.sourceNodeId);
+    const target = targets.get(candidate.targetRemId);
+    if (!source) {
+      immediate.push({ ...candidate, reason: "source-node-not-found" });
+    } else if (!target) {
+      immediate.push({ ...candidate, reason: "target-rem-not-found" });
+    } else {
+      const group = bySource.get(candidate.sourceNodeId) ?? [];
+      group.push(candidate);
+      bySource.set(candidate.sourceNodeId, group);
+    }
+  }
+
+  const evaluated: Array<NativeLinkReady | NativeLinkBlocked> = [...immediate];
+  let sourceIndex = 0;
+  for (const [sourceNodeId, candidates] of bySource) {
+    const source = sources.get(sourceNodeId);
+    if (!source) continue;
+    const text = await richTextToString(plugin, source.text);
+    const backText = await richTextToString(plugin, source.backText);
+    for (const candidate of candidates) {
+      const target = targets.get(candidate.targetRemId);
+      if (!target) {
+        evaluated.push({ ...candidate, reason: "target-rem-not-found" });
+        continue;
+      }
+      const textCount = countOccurrences(text, candidate.raw);
+      const backTextCount = countOccurrences(backText, candidate.raw);
+      if (textCount + backTextCount !== 1) {
+        evaluated.push({ ...candidate, reason: "raw-link-not-single-occurrence-in-current-rem" });
+        continue;
+      }
+      evaluated.push({
+        ok: true,
+        source,
+        target,
+        raw: candidate.raw,
+        field: textCount === 1 ? "text" : "backText",
+        sourceNodeId: candidate.sourceNodeId,
+        targetRemId: candidate.targetRemId,
+        sourcePath: candidate.sourcePath,
+        targetPath: candidate.targetPath,
+        line: candidate.line,
+      });
+    }
+    sourceIndex += 1;
+    if (sourceIndex % 50 === 0) await yieldToEventLoop();
+  }
+  return evaluated;
+}
+
+async function rewriteNativeLinks(plugin: ReactRNPlugin, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const input = Array.isArray(params.candidates)
+    ? params.candidates
+    : Array.isArray(params.links)
+      ? params.links
+      : Array.isArray(params.rewrites)
+        ? params.rewrites
+        : [];
+  if (input.length === 0) throw new Error("rewriteNativeLinks requires candidates.");
+  const opId = str(params.opId) ?? newOpId();
+  const evaluated = await evaluateNativeLinkCandidates(plugin, input);
+  const ready = evaluated.filter((item): item is NativeLinkReady => item.ok);
+  const blocked = evaluated.filter((item): item is NativeLinkBlocked => !item.ok);
+  const remIds = uniqueRems(ready.map((item) => item.source)).map((rem) => rem._id);
+  if (params.dryRun === true || params.confirm !== true) {
+    return {
+      dryRun: true,
+      opId,
+      count: ready.length,
+      remIds,
+      blockedCount: blocked.length,
+      blocked: blocked.slice(0, 100),
+      warning: params.confirm === true ? undefined : "rewriteNativeLinks defaults to dry-run. Pass confirm:true after reviewing count/remIds.",
+    };
+  }
+  if (blocked.length > 0 && params.allowPartial !== true) {
+    throw new Error(`rewriteNativeLinks has ${blocked.length} blocked candidates. Pass only ready candidates or allowPartial:true.`);
+  }
+  const affected = uniqueRems(ready.map((item) => item.source));
+  const skipUndoRecord = params.skipUndoRecord === true;
+  const undoRecord = skipUndoRecord ? undefined : await captureUndoRecord("rewriteNativeLinks", opId, affected);
+  const rewritten: Array<Record<string, unknown>> = [];
+  const readyBySource = new Map<string, NativeLinkReady[]>();
+  for (const item of ready) {
+    const group = readyBySource.get(item.source._id) ?? [];
+    group.push(item);
+    readyBySource.set(item.source._id, group);
+  }
+  let sourceIndex = 0;
+  for (const items of readyBySource.values()) {
+    const source = items[0].source;
+    let nextText = source.text ?? (await toRichText(plugin, ""));
+    let nextBackText = source.backText ?? (await toRichText(plugin, ""));
+    let textChanged = false;
+    let backTextChanged = false;
+    for (const item of items) {
+      const to = await plugin.richText.rem(item.target).value();
+      if (item.field === "text") {
+        nextText = await replaceRawLinkRichText(plugin, nextText, item.raw, to);
+        textChanged = true;
+      } else {
+        nextBackText = await replaceRawLinkRichText(plugin, nextBackText, item.raw, to);
+        backTextChanged = true;
+      }
+      rewritten.push({
+        sourceNodeId: item.sourceNodeId,
+        targetRemId: item.targetRemId,
+        raw: item.raw,
+        field: item.field,
+        sourcePath: item.sourcePath,
+        targetPath: item.targetPath,
+        line: item.line,
+      });
+    }
+    if (textChanged) await source.setText(nextText);
+    if (backTextChanged) await source.setBackText(nextBackText);
+    sourceIndex += 1;
+    if (sourceIndex % 25 === 0) await yieldToEventLoop();
+  }
+  return {
+    opId,
+    count: rewritten.length,
+    remIds,
+    blockedCount: blocked.length,
+    rewritten,
+    undoRecord,
+    undoSkipped: skipUndoRecord,
+    warning: skipUndoRecord ? "Undo record skipped for approved native-link migration to avoid oversized rich-text payloads." : undefined,
+  };
 }
 
 async function mergedIntoRichText(plugin: ReactRNPlugin, keeper: RemObject): Promise<RichTextInterface> {
@@ -1473,13 +1772,14 @@ export async function executeAction(
     case "backupGraph": {
       const rems = await allAccessibleRems(plugin);
       const topLevel = rems.filter((rem) => rem.parent === null);
-      return buildSnapshot(plugin, topLevel.length > 0 ? topLevel : rems);
+      progress?.(0, rems.length, `Preparing graph backup for ${rems.length} Rem`);
+      return buildSnapshot(plugin, topLevel.length > 0 ? topLevel : rems, { total: rems.length, progress });
     }
     case "backupSubtree":
     case "exportSubtree": {
       const targets = await resolveTargets(plugin, params);
       const rems = targets.rems.length > 0 ? targets.rems : [await getManagedRoot(plugin)];
-      return buildSnapshot(plugin, rems);
+      return buildSnapshot(plugin, rems, { progress });
     }
     case "validateSnapshot": {
       const snapshot = asRecord(params.snapshot);
@@ -1520,6 +1820,8 @@ export async function executeAction(
       return bulkRetagRems(plugin, params);
     case "normalizeText":
       return normalizeTextRems(plugin, params);
+    case "rewriteNativeLinks":
+      return rewriteNativeLinks(plugin, params);
     case "mergeRems":
       return mergeRems(plugin, params);
     case "setProperty":
@@ -1669,9 +1971,26 @@ export async function executeAction(
     }
     case "appendToDocument": {
       const markdown = str(params.markdown) ?? str(params.md) ?? "";
-      if (!markdown.trim()) throw new Error("appendToDocument requires markdown/md.");
+      const docSpec = asRecord(params.docSpec ?? params.document);
+      const hasDocSpec = Object.keys(docSpec).length > 0;
+      if (!markdown.trim() && !hasDocSpec) throw new Error("appendToDocument requires markdown/md or docSpec.");
       const parent = await requireAccessibleRem(plugin, str(params.remId) ?? str(params.id), "Document");
-      if (params.dryRun === true) return { dryRun: true, parentId: parent._id, markdownBytes: markdown.length };
+      const directChildrenOnly =
+        hasDocSpec && !("text" in docSpec) && !("title" in docSpec) && !("richText" in docSpec) && !("backText" in docSpec) && Array.isArray(docSpec.children);
+      const docSpecsToAppend = hasDocSpec ? (directChildrenOnly ? docSpecChildren(docSpec) : [docSpec]) : [];
+      if (params.dryRun === true) {
+        return {
+          dryRun: true,
+          parentId: parent._id,
+          markdownBytes: markdown.length,
+          docSpecNodes: docSpecsToAppend.reduce((count, spec) => count + docSpecNodeCount(spec), 0),
+        };
+      }
+      if (hasDocSpec) {
+        const rems: RemObject[] = [];
+        for (const spec of docSpecsToAppend) rems.push(...(await createDocSpecTree(plugin, parent, spec)));
+        return { count: rems.length, remIds: rems.map((rem) => rem._id) };
+      }
       const rems = await plugin.rem.createTreeWithMarkdown(markdown, parent._id);
       return { count: rems.length, remIds: rems.map((rem) => rem._id) };
     }

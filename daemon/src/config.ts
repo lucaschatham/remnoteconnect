@@ -16,6 +16,7 @@ export type DaemonConfig = {
   tokenFile: string;
   token: string;
   allowedOrigins: string[];
+  readonlyMode: boolean;
 };
 
 export function defaultAppDir(): string {
@@ -72,6 +73,7 @@ export function loadConfig(overrides: Partial<DaemonConfig> = {}): DaemonConfig 
     logDir,
     tokenFile,
     token: overrides.token ?? process.env.REMNOTE_CONNECT_TOKEN ?? loadOrCreateToken(tokenFile),
+    readonlyMode: overrides.readonlyMode ?? process.env.REMNOTE_CONNECT_READONLY_MODE !== "off",
     allowedOrigins: overrides.allowedOrigins ?? [
       "http://localhost:8080",
       "http://127.0.0.1:8080",

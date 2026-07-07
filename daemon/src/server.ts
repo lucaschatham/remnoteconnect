@@ -50,6 +50,7 @@ const MAX_MULTI_DEPTH = 1;
 const MAX_MULTI_ACTIONS = 50;
 const MAGNITUDE_THRESHOLD = 50;
 const IRREVERSIBLE_SESSION_BUDGET = 3;
+const DEFAULT_BODY_LIMIT_BYTES = 50 * 1024 * 1024;
 const ENABLE_ACTION_LOGS = process.env.REMNOTE_CONNECT_LOG === "1";
 
 function sleep(ms: number): Promise<void> {
@@ -70,9 +71,25 @@ function responseFromError(error: unknown): ApiResponse<never> {
 }
 
 function pluginActionTimeout(action: string, params: Record<string, unknown>): number {
+  if (action === "backupGraph") {
+    const requested = Number(params.timeoutMs);
+    if (Number.isFinite(requested) && requested > 0) return Math.min(Math.max(requested, 120_000), 30 * 60_000);
+    return 15 * 60_000;
+  }
   if (action === "createFlashcards" || action === "addNotes") {
     const items = Array.isArray(params.cards) ? params.cards : Array.isArray(params.notes) ? params.notes : [];
     return Math.max(120_000, items.length * 1_000);
+  }
+  if (action === "createDocument" || action === "importAsync") {
+    const markdownBytes = Buffer.byteLength(String(params.markdown ?? params.md ?? ""));
+    const docSpecBytes = params.docSpec || params.document ? Buffer.byteLength(JSON.stringify(params.docSpec ?? params.document)) : 0;
+    return Math.max(120_000, Math.ceil(Math.max(markdownBytes, docSpecBytes) / 5_000) * 1_000);
+  }
+  if (action === "rewriteNativeLinks") {
+    const requested = Number(params.timeoutMs);
+    if (Number.isFinite(requested) && requested > 0) return Math.min(Math.max(requested, 120_000), 30 * 60_000);
+    const items = Array.isArray(params.candidates) ? params.candidates : Array.isArray(params.links) ? params.links : Array.isArray(params.rewrites) ? params.rewrites : [];
+    return Math.max(10 * 60_000, items.length * 5_000);
   }
   if (action === "capabilityProbes") return 120_000;
   return 30_000;
@@ -137,7 +154,8 @@ function consumesIrreversibleBudget(action: string, params: Record<string, unkno
   return Boolean(meta?.requiresDryRunHash || meta?.irreversible || (action === "mergeRems" && params.structural === true));
 }
 
-function isBlockedByReadonly(action: string, state: DispatchState): boolean {
+function isBlockedByReadonly(action: string, params: Record<string, unknown>, state: DispatchState): boolean {
+  if (params.dryRun === true) return false;
   return state.readonlyMode && getActionMetadata(action)?.mutates === true;
 }
 
@@ -147,11 +165,12 @@ async function runBridgeJob(
   params: Record<string, unknown>,
   timeoutMs: number,
   retryable: boolean,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const attempts = retryable ? 3 : 1;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await bridge.runJob(action, params, timeoutMs);
+      return await bridge.runJob(action, params, timeoutMs, { signal });
     } catch (error) {
       if (!retryable || attempt >= attempts || !retryableBridgeError(error)) throw error;
       await sleep(250 * attempt);
@@ -168,6 +187,7 @@ async function dispatchAction(
   config: DaemonConfig,
   state: DispatchState,
   depth = 0,
+  signal?: AbortSignal,
 ): Promise<ApiResponse> {
   if (action === "version") return ok(PROTOCOL_VERSION);
   if (action === "status") {
@@ -246,7 +266,7 @@ async function dispatchAction(
       daemonBuildHash: BUILD_HASH,
     });
   }
-  if (isBlockedByReadonly(action, state)) {
+  if (isBlockedByReadonly(action, params, state)) {
     return fail("readonly_mode", `${action} is blocked because RemNoteConnect read-only mode is enabled. Run readonly off to allow mutations.`, {
       action,
       readonlyMode: true,
@@ -320,7 +340,7 @@ async function dispatchAction(
     let okStatus = bridgeStatus.connected;
     if (bridgeStatus.connected) {
       try {
-        const scopeProbe = await runBridgeJob(bridge, "scopeProbe", {}, 60_000, true);
+        const scopeProbe = await runBridgeJob(bridge, "scopeProbe", {}, 60_000, true, signal);
         checks.scopeProbe = scopeProbe;
         okStatus = resultRecord(scopeProbe).ok === true;
       } catch (error) {
@@ -364,7 +384,7 @@ async function dispatchAction(
     try {
       const undoRecord = await readUndoRecord(config.appDir, opId);
       const started = Date.now();
-      const result = await runBridgeJob(bridge, "undo", { undoRecord }, pluginActionTimeout("undo", params), false);
+      const result = await runBridgeJob(bridge, "undo", { undoRecord }, pluginActionTimeout("undo", params), false, signal);
       await appendAudit(config.logDir, {
         ts: new Date().toISOString(),
         action: "undo",
@@ -381,7 +401,7 @@ async function dispatchAction(
   }
   if (action === "backupGraph") {
     try {
-      const snapshot = (await runBridgeJob(bridge, "backupGraph", params, 10 * 60_000, true)) as RemSnapshot;
+      const snapshot = (await runBridgeJob(bridge, "backupGraph", params, pluginActionTimeout("backupGraph", params), true, signal)) as RemSnapshot;
       return ok(await writeSnapshotBackup(config.backupDir, "graph", snapshot));
     } catch (error) {
       return responseFromError(error);
@@ -407,6 +427,7 @@ async function dispatchAction(
         config,
         state,
         depth + 1,
+        signal,
       );
     } catch (error) {
       return responseFromError(error);
@@ -430,7 +451,7 @@ async function dispatchAction(
         results.push(fail("bad_request", "Invalid nested action.", parsed.error.flatten()));
         continue;
       }
-      results.push(await dispatchAction(parsed.data.action, parsed.data.params, bridge, durableJobs, config, state, depth + 1));
+      results.push(await dispatchAction(parsed.data.action, parsed.data.params, bridge, durableJobs, config, state, depth + 1, signal));
     }
     return ok(results);
   }
@@ -461,7 +482,7 @@ async function dispatchAction(
     let preflight: unknown;
     let hash: string | undefined;
     if (needsSafetyPreflight) {
-      preflight = await runBridgeJob(bridge, action, { ...actionParams, dryRun: true, confirm: false }, pluginActionTimeout(action, actionParams), true);
+      preflight = await runBridgeJob(bridge, action, { ...actionParams, dryRun: true, confirm: false }, pluginActionTimeout(action, actionParams), true, signal);
       const count = countFromResult(preflight);
       if (typeof count === "number" && count > MAGNITUDE_THRESHOLD && Number(actionParams.confirmCount) !== count) {
         return fail("magnitude_guard", `${action} resolved ${count} targets. Pass confirmCount:${count} to execute.`, {
@@ -485,7 +506,7 @@ async function dispatchAction(
       }
     }
 
-    const result = await runBridgeJob(bridge, action, actionParams, pluginActionTimeout(action, actionParams), actionMeta?.retryable === true);
+    const result = await runBridgeJob(bridge, action, actionParams, pluginActionTimeout(action, actionParams), actionMeta?.retryable === true, signal);
     const resultHash = actionRequiresDryRunHash && resultRecord(result).dryRun === true ? dryRunHash(action, result) : undefined;
     if (resultHash) {
       state.dryRunHashes.add(resultHash);
@@ -557,8 +578,15 @@ function mediaContentType(name: string): string {
   if (lower.endsWith(".webp")) return "image/webp";
   if (lower.endsWith(".svg")) return "image/svg+xml";
   if (lower.endsWith(".mp3")) return "audio/mpeg";
+  if (lower.endsWith(".m4a")) return "audio/mp4";
   if (lower.endsWith(".wav")) return "audio/wav";
   if (lower.endsWith(".ogg")) return "audio/ogg";
+  if (lower.endsWith(".mp4")) return "video/mp4";
+  if (lower.endsWith(".mov")) return "video/quicktime";
+  if (lower.endsWith(".webm")) return "video/webm";
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  if (lower.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (lower.endsWith(".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
   return "application/octet-stream";
 }
 
@@ -573,7 +601,8 @@ async function readMediaFile(config: DaemonConfig, name: string): Promise<{ body
 }
 
 export function buildServer(config: DaemonConfig): ServerBundle {
-  const app = Fastify({ logger: false });
+  const bodyLimit = Number(process.env.REMNOTE_CONNECT_BODY_LIMIT_BYTES ?? DEFAULT_BODY_LIMIT_BYTES);
+  const app = Fastify({ logger: false, bodyLimit });
   const bridge = new PluginBridge(config);
   const durableJobs = new DurableJobManager(config, bridge);
   const wss = bridge.createWebSocketServer();
@@ -581,7 +610,7 @@ export function buildServer(config: DaemonConfig): ServerBundle {
     dryRunHashes: new Set<string>(),
     irreversibleRemaining: IRREVERSIBLE_SESSION_BUDGET,
     startedAt: Date.now(),
-    readonlyMode: false,
+    readonlyMode: config.readonlyMode,
   };
 
   app.server.on("upgrade", (request, socket, head) => {
@@ -636,20 +665,34 @@ export function buildServer(config: DaemonConfig): ServerBundle {
       reply.code(400);
       return fail("bad_request", "Invalid RemNoteConnect request envelope.", parsed.error.flatten());
     }
+    const abortController = new AbortController();
+    let responseReady = false;
+    const abortPendingJob = () => {
+      if (!responseReady) abortController.abort();
+    };
+    request.raw.once("aborted", abortPendingJob);
+    reply.raw.once("close", abortPendingJob);
     const startedAt = Date.now();
-    const response = await dispatchAction(parsed.data.action, parsed.data.params, bridge, durableJobs, config, state);
-    if (ENABLE_ACTION_LOGS) {
-      console.error(
-        JSON.stringify({
-          at: new Date().toISOString(),
-          action: parsed.data.action,
-          durationMs: Date.now() - startedAt,
-          ok: response.error === null,
-          errorCode: response.error?.code,
-        }),
-      );
+    try {
+      const response = await dispatchAction(parsed.data.action, parsed.data.params, bridge, durableJobs, config, state, 0, abortController.signal);
+      responseReady = true;
+      if (ENABLE_ACTION_LOGS) {
+        console.error(
+          JSON.stringify({
+            at: new Date().toISOString(),
+            action: parsed.data.action,
+            durationMs: Date.now() - startedAt,
+            ok: response.error === null,
+            errorCode: response.error?.code,
+          }),
+        );
+      }
+      return response;
+    } finally {
+      responseReady = true;
+      request.raw.off("aborted", abortPendingJob);
+      reply.raw.off("close", abortPendingJob);
     }
-    return response;
   });
 
   return { app, bridge };

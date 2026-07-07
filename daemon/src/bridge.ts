@@ -31,6 +31,16 @@ type JobRecord = {
   updatedAt: number;
 };
 
+type BridgeJobSummary = {
+  jobId: string;
+  status: string;
+  action: string;
+  createdAt?: number;
+  updatedAt: number;
+  progressCount: number;
+  lastProgress?: PendingJob["progress"][number];
+};
+
 export type BridgeStatus = {
   connected: boolean;
   connectedAt?: string;
@@ -41,11 +51,18 @@ export type BridgeStatus = {
   pendingJobs: number;
   activeConnections: number;
   retainedJobs: number;
+  pendingJobSummaries: BridgeJobSummary[];
+  retainedJobSummaries: BridgeJobSummary[];
 };
 
 const MAX_JOB_HISTORY = 500;
 const JOB_HISTORY_TTL_MS = 30 * 60 * 1000;
 const HEARTBEAT_INTERVAL_MS = 12_000;
+export const BRIDGE_MAX_PAYLOAD_BYTES = 512 * 1024 * 1024;
+
+type RunJobOptions = {
+  signal?: AbortSignal;
+};
 
 export class PluginBridge {
   private ws?: WebSocket;
@@ -57,7 +74,7 @@ export class PluginBridge {
   constructor(private readonly config: DaemonConfig) {}
 
   createWebSocketServer(): WebSocketServer {
-    const wss = new WebSocketServer({ noServer: true });
+    const wss = new WebSocketServer({ noServer: true, maxPayload: BRIDGE_MAX_PAYLOAD_BYTES });
     wss.on("connection", (ws, request) => {
       const origin = request.headers.origin;
       if (!isAllowedOrigin(origin, this.config)) {
@@ -80,6 +97,18 @@ export class PluginBridge {
       pendingJobs: this.pending.size,
       activeConnections: this.ws?.readyState === WebSocket.OPEN && Boolean(this.hello) ? 1 : 0,
       retainedJobs: this.jobs.size,
+      pendingJobSummaries: [...this.pending.values()].map((job) =>
+        this.publicJobSummary(job.jobId, {
+          status: "pending",
+          action: job.action,
+          progress: job.progress,
+          createdAt: job.createdAt,
+          updatedAt: Date.now(),
+        }),
+      ),
+      retainedJobSummaries: [...this.jobs.entries()]
+        .slice(-10)
+        .map(([jobId, job]) => this.publicJobSummary(jobId, job)),
     };
   }
 
@@ -90,11 +119,28 @@ export class PluginBridge {
     return { result: job, error: null };
   }
 
-  async runJob(action: string, params: Record<string, unknown>, timeoutMs = 30_000): Promise<unknown> {
+  async runJob(action: string, params: Record<string, unknown>, timeoutMs = 30_000, options: RunJobOptions = {}): Promise<unknown> {
+    if (action === "rewriteNativeLinks") timeoutMs = Math.max(timeoutMs, 10 * 60_000);
+    if (action === "rewriteNativeLinks") {
+      const count = Array.isArray(params.candidates)
+        ? params.candidates.length
+        : Array.isArray(params.links)
+          ? params.links.length
+          : Array.isArray(params.rewrites)
+            ? params.rewrites.length
+            : undefined;
+      console.error(JSON.stringify({ at: new Date().toISOString(), action, timeoutMs, count, dryRun: params.dryRun === true, confirm: params.confirm === true }));
+    }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.hello) {
       throw {
         code: "plugin_disconnected",
         message: "RemNote plugin is not connected to the local daemon.",
+      } satisfies ApiError;
+    }
+    if (options.signal?.aborted === true) {
+      throw {
+        code: "aborted",
+        message: "Plugin job aborted before dispatch.",
       } satisfies ApiError;
     }
 
@@ -124,6 +170,17 @@ export class PluginBridge {
       };
       this.pending.set(jobId, pendingJob);
       this.setJob(jobId, { status: "pending", action, progress: pendingJob.progress, updatedAt: Date.now() });
+      options.signal?.addEventListener(
+        "abort",
+        () => {
+          if (!this.pending.has(jobId)) return;
+          clearTimeout(timeout);
+          this.pending.delete(jobId);
+          this.setJob(jobId, { status: "aborted", action, progress: pendingJob.progress, updatedAt: Date.now() });
+          reject({ code: "aborted", message: `Aborted plugin job ${jobId}` });
+        },
+        { once: true },
+      );
     });
 
     this.ws.send(JSON.stringify(message));
@@ -145,6 +202,16 @@ export class PluginBridge {
 
     ws.on("pong", () => {
       alive = true;
+    });
+
+    ws.on("error", () => {
+      clearInterval(heartbeat);
+      if (this.ws === ws) {
+        this.ws = undefined;
+        this.hello = undefined;
+        this.connectedAt = undefined;
+        this.rejectPending("plugin_error", "RemNote plugin bridge socket failed before pending jobs completed.");
+      }
     });
 
     ws.on("message", (raw) => {
@@ -254,6 +321,7 @@ export class PluginBridge {
       code === "plugin_disconnected" ||
       code === "plugin_reconnected" ||
       code === "timeout" ||
+      code === "aborted" ||
       code === "unsupported" ||
       code === "not_implemented" ||
       code === "not_found" ||
@@ -285,6 +353,21 @@ export class PluginBridge {
   private setJob(jobId: string, record: JobRecord): void {
     this.jobs.set(jobId, record);
     this.pruneJobs();
+  }
+
+  private publicJobSummary(
+    jobId: string,
+    record: JobRecord & { createdAt?: number },
+  ): BridgeJobSummary {
+    return {
+      jobId,
+      status: record.status,
+      action: record.action,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      progressCount: record.progress.length,
+      lastProgress: record.progress.at(-1),
+    };
   }
 
   private pruneJobs(): void {

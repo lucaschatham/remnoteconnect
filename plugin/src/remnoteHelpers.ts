@@ -3,6 +3,13 @@ import { MANAGED_ROOT_NAME, normalizePath, parseQuery, unique, type RemSnapshot,
 import type { CardSummary, RemSummary, ResolvedTarget, RichTextish } from "./types.js";
 import type { CardObject, RemObject } from "./sdkTypes.js";
 
+type SnapshotProgressFn = (completed: number, total: number, message?: string) => void;
+type SnapshotContext = {
+  completed: number;
+  total: number;
+  progress?: SnapshotProgressFn;
+};
+
 type BuilderTextFormat = Exclude<RichTextFormatName, "cloze">;
 const BUILDER_TEXT_FORMATS = new Set<string>([
   "quote",
@@ -455,12 +462,19 @@ export async function resolveTargets(plugin: ReactRNPlugin, params: Record<strin
   return { rems, cards };
 }
 
-export async function snapshotNode(plugin: ReactRNPlugin, rem: RemObject): Promise<RemSnapshotNode> {
+export async function snapshotNode(plugin: ReactRNPlugin, rem: RemObject, context?: SnapshotContext): Promise<RemSnapshotNode> {
   const tags = await Promise.all(
     (await rem.getTagRems()).map(async (tag) => ({ id: tag._id, text: await richTextToString(plugin, tag.text) })),
   );
   const cards = await Promise.all((await rem.getCards()).map(summarizeCard));
-  const children = await Promise.all((await rem.getChildrenRem()).map((child) => snapshotNode(plugin, child)));
+  if (context) {
+    context.completed += 1;
+    if (context.completed === 1 || context.completed % 100 === 0 || context.completed === context.total) {
+      context.progress?.(context.completed, context.total, `Snapshotted ${context.completed}/${context.total || "?"} Rem`);
+    }
+    if (context.completed % 250 === 0) await yieldToEventLoop();
+  }
+  const children = await Promise.all((await rem.getChildrenRem()).map((child) => snapshotNode(plugin, child, context)));
   return {
     id: rem._id,
     text: await richTextToString(plugin, rem.text),
@@ -477,9 +491,19 @@ export async function snapshotNode(plugin: ReactRNPlugin, rem: RemObject): Promi
   };
 }
 
-export async function buildSnapshot(plugin: ReactRNPlugin, rems: RemObject[]): Promise<RemSnapshot> {
+export async function buildSnapshot(
+  plugin: ReactRNPlugin,
+  rems: RemObject[],
+  options: { total?: number; progress?: SnapshotProgressFn } = {},
+): Promise<RemSnapshot> {
   const root = await getManagedRoot(plugin);
-  const nodes = await Promise.all(rems.map((rem) => snapshotNode(plugin, rem)));
+  const context: SnapshotContext | undefined = options.progress
+    ? { completed: 0, total: Math.max(0, Number(options.total ?? 0)), progress: options.progress }
+    : undefined;
+  const nodes = await Promise.all(rems.map((rem) => snapshotNode(plugin, rem, context)));
+  if (context && context.completed !== context.total) {
+    context.progress?.(context.completed, context.completed, `Snapshotted ${context.completed} Rem`);
+  }
   return {
     schemaVersion: 1,
     exportedAt: new Date().toISOString(),

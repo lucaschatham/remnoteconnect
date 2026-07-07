@@ -6,15 +6,17 @@ import { WebSocket } from "ws";
 import { buildServer } from "../src/server.js";
 import { loadConfig } from "../src/config.js";
 import { startPluginStaticServer } from "../src/pluginStatic.js";
+import { BRIDGE_MAX_PAYLOAD_BYTES } from "../src/bridge.js";
 import { BUILD_HASH, IRREVERSIBLE_RECONFIRM_PHRASE } from "@remnoteconnect/shared";
 
-function testBundle() {
+function testBundle(options: { readonlyMode?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "remnote-connect-"));
   const config = loadConfig({
     appDir: join(dir, "app"),
     backupDir: join(dir, "backups"),
     tokenFile: join(dir, "app", "token"),
     token: "test-token-test-token",
+    readonlyMode: options.readonlyMode ?? false,
   });
   const bundle = buildServer(config);
   return { ...bundle, config, dir };
@@ -205,7 +207,7 @@ describe("daemon server", () => {
   });
 
   it("toggles daemon-enforced read-only mode and blocks mutating plugin actions before dispatch", async () => {
-    const bundle = testBundle();
+    const bundle = testBundle({ readonlyMode: true });
     dirs.push(bundle.dir);
     const port = await listen(bundle);
     const seenActions: string[] = [];
@@ -217,13 +219,21 @@ describe("daemon server", () => {
     });
     await ready;
 
+    const initialStatus = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "status", version: 1 },
+    });
+    expect(initialStatus.json().result.readonlyMode).toBe(true);
+
     const enabled = await bundle.app.inject({
       method: "POST",
       url: "/",
       headers: authHeaders,
       payload: { action: "readonly", version: 1, params: { mode: "on" } },
     });
-    expect(enabled.json().result).toMatchObject({ readonlyMode: true, changed: true });
+    expect(enabled.json().result).toMatchObject({ readonlyMode: true, changed: false });
 
     const status = await bundle.app.inject({
       method: "POST",
@@ -250,6 +260,15 @@ describe("daemon server", () => {
     });
     expect(blockedPluginMutation.json().error.code).toBe("readonly_mode");
 
+    const dryRunPluginMutation = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "rewriteNativeLinks", version: 1, params: { dryRun: true, candidates: [{ sourceNodeId: "a", targetRemId: "b", raw: "B" }] } },
+    });
+    expect(dryRunPluginMutation.json().error).toBeNull();
+    expect(dryRunPluginMutation.json().result).toMatchObject({ count: 0 });
+
     const blockedDaemonMutation = await bundle.app.inject({
       method: "POST",
       url: "/",
@@ -257,7 +276,7 @@ describe("daemon server", () => {
       payload: { action: "createFlashcardsAsync", version: 1, params: { cards: [{ front: "A", back: "B" }], confirm: true } },
     });
     expect(blockedDaemonMutation.json().error.code).toBe("readonly_mode");
-    expect(seenActions).toEqual(["searchGraph"]);
+    expect(seenActions).toEqual(["searchGraph", "rewriteNativeLinks"]);
 
     const disabled = await bundle.app.inject({
       method: "POST",
@@ -274,7 +293,7 @@ describe("daemon server", () => {
       payload: { action: "createFlashcard", version: 1, params: { front: "A", back: "B" } },
     });
     expect(mutationAfterDisable.json().error).toBeNull();
-    expect(seenActions).toEqual(["searchGraph", "createFlashcard"]);
+    expect(seenActions).toEqual(["searchGraph", "rewriteNativeLinks", "createFlashcard"]);
     ws.close();
     await bundle.app.close();
   });
@@ -320,6 +339,52 @@ describe("daemon server", () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json().error.code).toBe("plugin_disconnected");
+  });
+
+  it("sets the local bridge payload limit above the ws default for graph backups", () => {
+    expect(BRIDGE_MAX_PAYLOAD_BYTES).toBeGreaterThan(100 * 1024 * 1024);
+  });
+
+  it("passes backupGraph timeoutMs through the bridge and writes a snapshot", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    const { ws, ready } = connectPlugin(port, {
+      onJob(message, socket) {
+        expect(message.action).toBe("backupGraph");
+        expect(message.params.timeoutMs).toBe(180_000);
+        socket.send(
+          JSON.stringify({
+            type: "result",
+            jobId: message.jobId,
+            result: {
+              schemaVersion: 1,
+              exportedAt: "2026-07-02T00:00:00.000Z",
+              rootId: "root",
+              rootName: "Graph",
+              warning: "Snapshot restore recreates Rem as copies with new IDs.",
+              nodeCount: 1,
+              nodes: [{ id: "root", text: "Graph", children: [] }],
+            },
+            error: null,
+          }),
+        );
+      },
+    });
+    await ready;
+
+    const response = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "backupGraph", version: 1, params: { timeoutMs: 180_000 } },
+    });
+
+    expect(response.json().error).toBeNull();
+    expect(response.json().result.nodeCount).toBe(1);
+    expect(existsSync(response.json().result.path)).toBe(true);
+    ws.close();
+    await bundle.app.close();
   });
 
   it("destructive actions default to dry-run and need the plugin bridge to resolve targets", async () => {
@@ -530,6 +595,109 @@ describe("daemon server", () => {
       payload: { action: "jobStatus", version: 1, params: { jobId: completedJobId } },
     });
     expect(complete.json().result.status).toBe("complete");
+    ws.close();
+    await bundle.app.close();
+  });
+
+  it("exposes sanitized pending job progress in status", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    let pendingJobId = "";
+    const { ws, ready } = connectPlugin(port, {
+      onJob(message, socket) {
+        pendingJobId = message.jobId;
+        socket.send(JSON.stringify({ type: "progress", jobId: message.jobId, completed: 12, total: 100, message: "Snapshotted 12/100 Rem" }));
+      },
+    });
+    await ready;
+
+    const controller = new AbortController();
+    const request = fetch(`http://127.0.0.1:${port}/`, {
+      method: "POST",
+      headers: {
+        host: "127.0.0.1:8766",
+        authorization: "Bearer test-token-test-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ action: "backupGraph", version: 1, params: {} }),
+      signal: controller.signal,
+    });
+
+    const summary = await eventually(
+      async () => {
+        const status = await bundle.app.inject({ method: "POST", url: "/", headers: authHeaders, payload: { action: "status", version: 1 } });
+        return status.json().result.bridge.pendingJobSummaries?.[0];
+      },
+      (value) => value?.lastProgress?.completed === 12,
+    );
+    expect(summary).toMatchObject({
+      jobId: pendingJobId,
+      status: "pending",
+      action: "backupGraph",
+      progressCount: 1,
+      lastProgress: { completed: 12, total: 100, message: "Snapshotted 12/100 Rem" },
+    });
+    expect(JSON.stringify(summary)).not.toContain("test-token-test-token");
+
+    controller.abort();
+    await expect(request).rejects.toThrow();
+    ws.close();
+    await bundle.app.close();
+  });
+
+  it("clears a pending bridge job when the HTTP client aborts", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    let pendingJobId = "";
+    const { ws, ready } = connectPlugin(port, {
+      onJob(message) {
+        pendingJobId = message.jobId;
+      },
+    });
+    await ready;
+
+    const controller = new AbortController();
+    const request = fetch(`http://127.0.0.1:${port}/`, {
+      method: "POST",
+      headers: {
+        host: "127.0.0.1:8766",
+        authorization: "Bearer test-token-test-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ action: "createFlashcard", version: 1, params: { front: "A", back: "B" } }),
+      signal: controller.signal,
+    });
+
+    await eventually(
+      async () => {
+        const status = await bundle.app.inject({ method: "POST", url: "/", headers: authHeaders, payload: { action: "status", version: 1 } });
+        return status.json().result.bridge.pendingJobs as number;
+      },
+      (pendingJobs) => pendingJobs === 1,
+    );
+    expect(pendingJobId).toMatch(/[0-9a-f-]{36}/);
+
+    controller.abort();
+    await expect(request).rejects.toThrow();
+
+    await eventually(
+      async () => {
+        const status = await bundle.app.inject({ method: "POST", url: "/", headers: authHeaders, payload: { action: "status", version: 1 } });
+        return status.json().result.bridge.pendingJobs as number;
+      },
+      (pendingJobs) => pendingJobs === 0,
+    );
+
+    const aborted = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "jobStatus", version: 1, params: { jobId: pendingJobId } },
+    });
+    expect(aborted.json().result.status).toBe("aborted");
+
     ws.close();
     await bundle.app.close();
   });

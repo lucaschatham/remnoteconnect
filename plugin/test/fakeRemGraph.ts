@@ -201,6 +201,7 @@ export class FakeRemGraph {
   readonly plugin: ReactRNPlugin;
   readonly root: FakeRem;
   cardMaterializeAfterReads = 0;
+  replaceAllRichTextCalls = 0;
   private sequence = 0;
 
   constructor() {
@@ -215,8 +216,10 @@ export class FakeRemGraph {
         toString: async (value: unknown) => this.richTextToString(value),
         toMarkdown: async (value: unknown) => this.richTextToString(value),
         parseFromMarkdown: async (value: string) => value,
-        replaceAllRichText: async (richText: unknown, findText: unknown, replacementText: unknown) =>
-          this.richTextToString(richText).split(this.richTextToString(findText)).join(this.richTextToString(replacementText)),
+        replaceAllRichText: async (richText: unknown, findText: unknown, replacementText: unknown) => {
+          this.replaceAllRichTextCalls += 1;
+          return this.richTextToString(richText).split(this.richTextToString(findText)).join(this.richTextToString(replacementText));
+        },
       },
       rem: {
         createRem: async () => this.createTopLevel(""),

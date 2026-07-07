@@ -115,17 +115,17 @@ export class DurableJobManager {
 
   private async kick(jobId: string): Promise<void> {
     if (this.running.has(jobId)) return;
-    const job = await readDurableJob(this.config.appDir, jobId);
-    if (!job || job.status === "complete" || job.status === "error") return;
-    if (!this.bridge.status().connected) {
-      if (job.status !== "queued") {
-        job.status = "queued";
-        await this.save(job);
-      }
-      return;
-    }
     this.running.add(jobId);
     try {
+      const job = await readDurableJob(this.config.appDir, jobId);
+      if (!job || job.status === "complete" || job.status === "error") return;
+      if (!this.bridge.status().connected) {
+        if (job.status !== "queued") {
+          job.status = "queued";
+          await this.save(job);
+        }
+        return;
+      }
       await this.process(job);
     } finally {
       this.running.delete(jobId);

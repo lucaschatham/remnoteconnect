@@ -40,8 +40,8 @@ function usage() {
   rnc confirm-materialized --job-id JOB_ID
   rnc undo OP_ID
   rnc journal-tail [N]
-  rnc list-tombstones
-  rnc backup-graph
+	  rnc list-tombstones
+	  rnc backup-graph [--watch] [--timeout-ms N]
   rnc empty-trash [--from-dry-run HASH] [--confirm] [--confirm-count N]
 
 Options:
@@ -101,6 +101,84 @@ async function call(action, params = {}) {
   return body.result;
 }
 
+async function callWithSignal(action, params = {}, signal) {
+  const response = await fetch(DEFAULT_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ action, version: 1, params }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+  }
+  const body = await response.json();
+  if (body.error) {
+    const error = new Error(body.error.message);
+    error.details = body.error;
+    throw error;
+  }
+  return body.result;
+}
+
+async function backupGraphWithWatch(flags) {
+  const controller = new AbortController();
+  const timeoutMs = flags.timeoutMs === undefined ? undefined : Number(flags.timeoutMs);
+  let timeout;
+  let lastLine = "";
+  let finished = false;
+
+  const stop = () => {
+    if (!finished) controller.abort();
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timeout = setTimeout(() => {
+      console.error(`backup-graph watch timeout after ${timeoutMs}ms; aborting request`);
+      controller.abort();
+    }, timeoutMs);
+  }
+
+  const request = callWithSignal("backupGraph", commonParams(flags), controller.signal);
+  const poll = async () => {
+    while (!finished) {
+      try {
+        const status = await call("status", {});
+        const job =
+          status.bridge?.pendingJobSummaries?.find((item) => item.action === "backupGraph") ??
+          status.bridge?.retainedJobSummaries?.find((item) => item.action === "backupGraph");
+        if (job) {
+          const progress = job.lastProgress;
+          const line = progress
+            ? `${job.status} ${job.action} ${progress.completed}/${progress.total || "?"}: ${progress.message ?? ""}`
+            : `${job.status} ${job.action} progress pending`;
+          if (line !== lastLine) {
+            console.error(line);
+            lastLine = line;
+          }
+        }
+      } catch (error) {
+        if (!finished) console.error(`backup-graph watch status poll failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, Number(flags.intervalMs ?? 2000)));
+    }
+  };
+  const poller = poll();
+
+  try {
+    return await request;
+  } finally {
+    finished = true;
+    if (timeout) clearTimeout(timeout);
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    await poller;
+  }
+}
+
 function print(result, flags) {
   if (!flags.json && result && typeof result === "object" && !Array.isArray(result)) {
     if (typeof result.tsv === "string") {
@@ -121,6 +199,7 @@ function commonParams(flags) {
   if (flags.confirm) params.confirm = true;
   if (flags.confirmCount !== undefined) params.confirmCount = Number(flags.confirmCount);
   if (flags.fromDryRun !== undefined) params.fromDryRun = String(flags.fromDryRun);
+  if (flags.timeoutMs !== undefined) params.timeoutMs = Number(flags.timeoutMs);
   return params;
 }
 
@@ -270,7 +349,7 @@ async function main() {
   } else if (command === "list-tombstones") {
     result = await call("listTombstones", commonParams(flags));
   } else if (command === "backup-graph") {
-    result = await call("backupGraph", commonParams(flags));
+    result = flags.watch ? await backupGraphWithWatch(flags) : await call("backupGraph", commonParams(flags));
   } else if (command === "empty-trash") {
     result = await call("emptyTrash", commonParams(flags));
   } else {

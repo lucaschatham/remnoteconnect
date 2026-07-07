@@ -1,206 +1,208 @@
 # RemNoteConnect
 
-Private local Mac bridge for controlling RemNote from terminal tools through an AnkiConnect-inspired JSON API.
+RemNoteConnect is a local bridge that lets terminal tools, scripts, and LLM agents work with your RemNote knowledge base through a small HTTP API and CLI.
 
-## What It Does
+It is built for people who use RemNote as a learning system: capture notes, connect ideas, clean up messy imports, create flashcards, and review knowledge faster without giving a cloud service direct control of your database.
 
-- Runs a local daemon on `127.0.0.1:8766`.
-- Loads a RemNote frontend plugin from `http://127.0.0.1:8080`.
-- The plugin executes RemNote SDK reads/writes with whole-KB permission after RemNote approval.
-- HTTP callers use `{ "action": "...", "version": 1, "params": { ... } }`.
-- Destructive and bulk operations are dry-run-first. Soft delete moves Rem to `RemNoteConnect/Trash/<opId>` and writes a local undo record.
-- `readonly` mode lets an LLM inspect/search/map the graph while daemon-side guards reject every mutating action.
-- The plugin iframe shows bridge health, token presence, All-scope status, active jobs, heartbeat, and daemon/plugin build match.
+> Status: experimental local-first tooling. It is not affiliated with RemNote.
 
-This is workflow parity with AnkiConnect, not literal Anki compatibility. Anki-only model/template/package APIs return stable `unsupported` errors.
+## Why This Exists
 
-## Setup
+RemNote is powerful for learning because it combines an outliner, knowledge graph, spaced repetition, and flashcards. The missing piece is a fast local control surface that an assistant can use safely.
 
-1. Create a top-level Rem in RemNote named exactly:
+RemNoteConnect gives you that surface:
 
-   `RemNoteConnect`
+- Read and map your RemNote graph from the terminal.
+- Create documents and flashcards from notes, articles, books, lectures, or research.
+- Search, audit, and clean up duplicate or low-quality Rem.
+- Run bulk operations behind dry-run and exact-count approval gates.
+- Keep a local read/write boundary: the daemon is on `127.0.0.1`, protected by a local token.
 
-2. Install and build:
+The goal is not to replace RemNote. The goal is to make RemNote easier to operate when you are learning quickly across many domains.
 
-   ```sh
-   cd /Users/HQ/Documents/Codex/RemNoteConnect
-   npx pnpm@11.7.0 install
-   npx pnpm@11.7.0 build
-   ```
+## What You Can Do With It
 
-3. Start the daemon:
+### Learn Any Topic Faster
 
-   ```sh
-   npx pnpm@11.7.0 --filter @remnoteconnect/daemon start
-   ```
+Use RemNoteConnect to build a repeatable learning loop:
 
-   The daemon also serves the built plugin bundle at `http://127.0.0.1:8080`.
+1. Capture raw material into RemNote.
+2. Ask an LLM to extract atomic concepts.
+3. Turn the best concepts into RemNote-native flashcards.
+4. Link new ideas to existing Rem.
+5. Audit weak cards, duplicates, orphan notes, and empty placeholders.
+6. Keep the graph clean enough that review and search stay useful.
 
-4. Print the token:
+Good use cases:
 
-   ```sh
-   npx pnpm@11.7.0 token:unsafe
-   ```
+- Build a study guide from a textbook chapter.
+- Convert lecture notes into linked concepts and cards.
+- Generate flashcards only after you approve the source notes.
+- Find related ideas before writing an essay or research memo.
+- Keep a “learning cockpit” for progress across domains.
 
-5. In RemNote desktop, load the local plugin from:
+### Control RemNote From Any LLM
 
-   `http://127.0.0.1:8080`
-
-   Use `npx pnpm@11.7.0 dev:plugin` only when actively developing the plugin.
-
-6. Open the RemNoteConnect plugin settings and paste the daemon token.
-
-7. Run a smoke test:
-
-   ```sh
-   npx pnpm@11.7.0 smoke
-   ```
-
-8. Run the whole-KB scope check:
-
-   ```sh
-   node scripts/rnc.mjs doctor
-   ```
-
-## Example Calls
+The primary interface is CLI-first:
 
 ```sh
-TOKEN="$(npx pnpm@11.7.0 --silent token:unsafe)"
-curl -sS http://127.0.0.1:8766 \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"action":"status","version":1}'
-```
-
-CLI-first usage:
-
-```sh
-node scripts/rnc.mjs describe
+node scripts/rnc.mjs status
 node scripts/rnc.mjs readonly on
 node scripts/rnc.mjs map --depth 3
 node scripts/rnc.mjs search 'text:mitochondria'
-node scripts/rnc.mjs readonly off
-node scripts/rnc.mjs create-document --doc-spec ./doc.json --parent Inbox --confirm
+node scripts/rnc.mjs create-document --md ./notes.md --parent "Biology" --confirm
 ```
 
-Create a flashcard:
+Because the CLI is plain shell, it can be used by Codex, Claude Code, Cursor agents, local scripts, cron jobs, or any future tool that can run commands.
 
-```sh
-curl -sS http://127.0.0.1:8766 \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "action":"createFlashcard",
-    "version":1,
-    "params":{
-      "deckPath":"Behavior Change",
-      "front":"What is an implementation intention?",
-      "back":"A plan that links a situational cue to a specific response.",
-      "tags":["behavior-change"]
-    }
-  }'
+## Architecture
+
+```mermaid
+flowchart LR
+  CLI["CLI / scripts / LLM agent"] --> Daemon["Local daemon\n127.0.0.1:8766"]
+  Daemon --> Bridge["WebSocket bridge"]
+  Bridge --> Plugin["RemNote plugin iframe\n127.0.0.1:8080"]
+  Plugin --> SDK["RemNote Plugin SDK"]
+  SDK --> KB["Your RemNote knowledge base"]
 ```
 
-AnkiConnect-inspired addNote:
-
-```sh
-curl -sS http://127.0.0.1:8766 \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "action":"addNote",
-    "version":1,
-    "params":{
-      "note":{
-        "deckName":"Behavior Change",
-        "fields":{"Front":"Cue?","Back":"Response."},
-        "tags":["example"]
-      }
-    }
-  }'
-```
-
-## API v1
-
-Native actions:
-
-- `version`, `status`, `capabilities`, `multi`, `jobStatus`
-- `jobWait`, `confirmMaterialized`
-- `describe`, `doctor`, `metrics`, `readonly`, `scopeProbe`
-- `listRoots`, `createRem`, `createFolder`, `renameRem`, `moveRem`, `deleteRem`
-- `map`, `getRem`, `searchGraph`, `backupGraph`, `journalTail`, `undo`, `undoClear`, `emptyTrash`
-- `exportSubtree`, `importSnapshot`, `backupSubtree`, `validateSnapshot`
-- `createFlashcard`, `createFlashcards`, `updateFlashcard`, `deleteFlashcards`, `getFlashcard`, `searchFlashcards`
-- `searchRem`, `findByTag`, `auditManagedRoot`, `dryRunDelete`
-- `createDocument`, `getDocument`, `appendToDocument`, `setProperty`, `getProperties`
-- `listTombstones`, `restoreTombstone`, `bulkDelete`
-- `findDuplicates`, `mergeRems`, `findOrphans`, `findEmpty`, `normalizeText`, `bulkRetag`, `bulkMove`
-- `createFlashcardsAsync`, `importAsync`
-
-AnkiConnect-inspired actions:
-
-- `addNote`, `addNotes`, `canAddNote`
-- `findNotes`, `notesInfo`, `deleteNotes`
-- `deckNames`, `createDeck`, `changeDeck`
-
-Query grammar:
-
-- `deck:<path>`
-- `tag:<tag>`
-- `text:<text>`
-- `id:<remId>`
-
-Structured document specs use compact rich text and nested children:
-
-```json
-{
-  "richText": {
-    "segments": [
-      { "type": "text", "text": "Concept ", "formats": ["bold"] },
-      { "type": "latex", "text": "x^2" }
-    ]
-  },
-  "properties": [{ "powerupCode": "b", "slot": "URL", "value": "https://example.com" }],
-  "children": [{ "text": "Child Rem" }]
-}
-```
+RemNote does not expose a general backend API for this use case, so writes happen through a RemNote frontend plugin. The local daemon handles auth, request validation, safety gates, job state, backups, and CLI/API ergonomics.
 
 ## Safety Model
 
-- The daemon binds only to `127.0.0.1`.
-- HTTP calls require a bearer token.
-- WebSocket plugin auth uses a first-message token handshake.
-- Host and Origin are validated.
-- The plugin requests `All / ReadCreateModifyDelete`; `doctor` verifies the grant with `scopeProbe`.
-- Soft delete is reversible by stable ID through the daemon undo store.
-- `emptyTrash` is the only hard-delete path. It requires a prior dry-run hash.
-- `backupGraph` is explicit and opt-in.
-- Snapshot restore recreates Rem as copies with new IDs. It does not preserve inbound references, portals, or scheduling history.
-- `readonly on` blocks every `mutates:true` action in the daemon before plugin dispatch.
-- `doctor` warns if the connected plugin build hash does not match the daemon build hash.
+RemNoteConnect can request whole-knowledge-base access, so the safety model is explicit:
 
-## Daily Driver
+- The daemon binds to `127.0.0.1`.
+- Every HTTP request requires a bearer token stored in your local app-support directory.
+- Mutating actions are blocked while `readonly` mode is on.
+- Destructive and bulk operations are dry-run-first.
+- Large operations require exact `confirmCount` approval.
+- Soft delete moves Rem into `RemNoteConnect/Trash/<opId>` instead of hard-deleting.
+- `emptyTrash` is the only hard-delete path.
+- Snapshot restore is treated as disaster recovery, not true undo, because restored Rem get new IDs.
 
-After `npx pnpm@11.7.0 build`, generate a LaunchAgent:
+Read [docs/INVARIANTS.md](docs/INVARIANTS.md) before using this against a real knowledge base.
+
+## Quickstart
+
+Requirements:
+
+- macOS
+- RemNote desktop
+- Node.js
+- `pnpm`
+
+Install:
+
+```sh
+git clone <your-remnoteconnect-repo-url>
+cd RemNoteConnect
+npx pnpm@11.7.0 install
+npx pnpm@11.7.0 build
+```
+
+Start the local daemon:
+
+```sh
+npx pnpm@11.7.0 --filter @remnoteconnect/daemon start
+```
+
+The daemon serves the plugin bundle at:
+
+```text
+http://127.0.0.1:8080
+```
+
+In RemNote desktop:
+
+1. Open Plugins.
+2. Go to Build.
+3. Choose “Develop from localhost”.
+4. Enter `http://127.0.0.1:8080`.
+5. Approve the requested permissions.
+
+Print the local daemon token and paste it into the plugin settings:
+
+```sh
+npx pnpm@11.7.0 token:unsafe
+```
+
+Then verify:
+
+```sh
+node scripts/rnc.mjs doctor
+node scripts/rnc.mjs status
+```
+
+For daily use, install the LaunchAgent:
 
 ```sh
 npx pnpm@11.7.0 launch-agent:install
 ```
 
-Then load the printed plist with the printed `launchctl bootstrap ...` command.
+## API Shape
 
-Check or remove it with:
+RemNoteConnect exposes a native action API:
 
-```sh
-npx pnpm@11.7.0 launch-agent:check
-npx pnpm@11.7.0 launch-agent:uninstall
+```json
+{
+  "action": "createFlashcard",
+  "version": 1,
+  "params": {
+    "deckPath": "Biology/Cellular Respiration",
+    "front": "What does ATP synthase do?",
+    "back": "It uses the proton gradient to synthesize ATP from ADP and phosphate.",
+    "tags": ["biology", "energy-metabolism"]
+  }
+}
 ```
 
-The normal daily-driver daemon serves the built RemNote plugin at `http://127.0.0.1:8080`; Vite is only needed for plugin development.
+It also includes an AnkiConnect-inspired adapter for familiar workflows:
+
+- `addNote`
+- `addNotes`
+- `canAddNote`
+- `findNotes`
+- `notesInfo`
+- `deckNames`
+- `createDeck`
+- `changeDeck`
+
+This is workflow parity, not literal Anki compatibility. Anki-specific model, template, scheduler, and `.apkg` actions return stable unsupported errors.
+
+## Core Actions
+
+Common native actions:
+
+- `status`, `doctor`, `describe`, `capabilities`, `readonly`
+- `map`, `getRem`, `searchGraph`, `findByTag`
+- `createDocument`, `getDocument`, `appendToDocument`
+- `createFlashcard`, `createFlashcards`, `updateFlashcard`, `searchFlashcards`
+- `renameRem`, `moveRem`, `deleteRem`, `bulkMove`, `bulkDelete`
+- `findDuplicates`, `findEmpty`, `findOrphans`, `normalizeText`
+- `backupGraph`, `journalTail`, `undo`, `listTombstones`, `emptyTrash`
+
+Run:
+
+```sh
+node scripts/rnc.mjs describe
+```
+
+to inspect the available action metadata from your local build.
+
+## Learning Workflows
+
+See [docs/LEARNING_WORKFLOWS.md](docs/LEARNING_WORKFLOWS.md) for practical patterns:
+
+- reading a book
+- studying a technical topic
+- creating atomic flashcards
+- cleaning up a messy graph
+- using RemNoteConnect with an LLM agent
 
 ## Verification
 
-Static gates:
+Static checks:
 
 ```sh
 npx pnpm@11.7.0 -r typecheck
@@ -211,13 +213,7 @@ npx pnpm@11.7.0 check:no-token
 npx pnpm@11.7.0 check:redteam
 ```
 
-In non-interactive shells, if pnpm asks to purge `node_modules`, restore/verify dependencies explicitly:
-
-```sh
-CI=true npx pnpm@11.7.0 --config.confirmModulesPurge=false install --frozen-lockfile --prod=false
-```
-
-After RemNote has loaded `http://127.0.0.1:8080` and `node scripts/rnc.mjs doctor` is green:
+Live checks require RemNote desktop with the local plugin connected:
 
 ```sh
 node scripts/live-security.mjs
@@ -227,19 +223,29 @@ node scripts/live-softdelete.mjs
 node scripts/live-docs.mjs
 node scripts/live-cleanup.mjs
 node scripts/live-idempotent.mjs
-npx pnpm@11.7.0 chaos:daemon
-npx pnpm@11.7.0 chaos:async
 ```
 
-## Recovery
+## Public Repo Checklist
 
-- Stop daemon: `Ctrl-C` or unload the LaunchAgent.
-- Token file: `~/Library/Application Support/RemNoteConnect/token`
-- Backups: `~/Documents/RemNoteConnect/Backups`
-- If a plugin causes trouble, open RemNote with plugin disabling according to RemNote’s documented recovery flow.
+Before pushing a public repo, read [docs/PUBLICATION_CHECKLIST.md](docs/PUBLICATION_CHECKLIST.md).
 
-## RemNote Dark Mode
+In particular, do not publish:
 
-RemNoteConnect does not install global CSS, mutate RemNote theme state, or style the host app outside its sandboxed iframe. Core RemNote documents honor RemNote's native `Dark` interface setting and persist after app restart.
+- daemon tokens
+- local app-support files
+- private RemNote exports
+- Obsidian migration reports
+- generated audit JSON containing personal note titles or snippets
 
-RemNote Community and generated study-deck routes may still render light. RemNote's own packaged app logic excludes those learning/community routes from the global dark-mode predicate, so that behavior is upstream RemNote UI behavior, not caused by this bridge.
+## Limitations
+
+- This is local-first Mac tooling today.
+- The RemNote plugin must be loaded and connected for RemNote reads/writes.
+- Mobile RemNote apps do not run this local desktop bridge.
+- Whole-graph operations require care. Use `readonly on`, dry-runs, and exact-count approvals.
+- Some RemNote features depend on what the Plugin SDK exposes.
+- Image occlusion and advanced media workflows should be treated as experimental until verified against your RemNote version.
+
+## License
+
+No open-source license has been selected yet. Until a license is added, the default copyright rules apply.

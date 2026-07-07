@@ -229,6 +229,19 @@ describe("plugin executor", () => {
     expect(answer.id).toBe(card.cards[0].id);
   });
 
+  it("emits progress while building graph backups", async () => {
+    const graph = new FakeRemGraph();
+    await graph.createChild(graph.root, "Backup child");
+    const progress = vi.fn();
+
+    const snapshot = (await executeAction(graph.plugin, "backupGraph", {}, progress)) as { nodeCount: number };
+
+    expect(snapshot.nodeCount).toBe(2);
+    expect(progress).toHaveBeenCalledWith(0, 2, "Preparing graph backup for 2 Rem");
+    expect(progress).toHaveBeenCalledWith(1, 2, "Snapshotted 1/2 Rem");
+    expect(progress).toHaveBeenCalledWith(2, 2, "Snapshotted 2/2 Rem");
+  });
+
   it("maps Anki-style notes and relies on daemon-injected existingRemId for idempotency", async () => {
     expect(
       ankiNoteToFlashcard({
@@ -354,6 +367,23 @@ describe("plugin executor", () => {
     expect(updated).toMatchObject({ id: created.id, updatedExisting: true, childrenSkipped: true });
     expect(root?.text).toBe("Spec Root Updated");
     expect((await root?.getChildrenRem())?.map((child) => child.text)).toEqual(["Child A", "| Metric | Value |\n| --- | --- |\n| Count | 2 |"]);
+
+    const appended = (await executeAction(graph.plugin, "appendToDocument", {
+      id: created.id,
+      docSpec: {
+        children: [
+          { text: "Recovered Content", children: [{ text: "Recovered child" }] },
+          { text: "Second recovered child" },
+        ],
+      },
+    })) as { count: number; remIds: string[] };
+    expect(appended.count).toBe(3);
+    expect((await root?.getChildrenRem())?.map((child) => child.text)).toEqual([
+      "Child A",
+      "| Metric | Value |\n| --- | --- |\n| Count | 2 |",
+      "Recovered Content",
+      "Second recovered child",
+    ]);
   });
 
   it("supports map, markdown documents, tombstone listing, emptyTrash dry-run, and duplicate discovery", async () => {
@@ -522,5 +552,69 @@ describe("plugin executor", () => {
     expect(child.parent).toBe(loser._id);
     expect(ref.text).toContain(graph.reference(loser._id));
     expect(ref.text).not.toContain(graph.reference(keeper._id));
+  });
+
+  it("rewrites verified raw links into native Rem references with undo", async () => {
+    const graph = new FakeRemGraph();
+    const target = await graph.createChild(graph.root, "Target Concept");
+    const source = await graph.createChild(graph.root, "Read Target Concept today");
+
+    const candidate = {
+      sourceNodeId: source._id,
+      targetRemId: target._id,
+      raw: "Target Concept",
+      sourcePath: "Source.md",
+      targetPath: "Target Concept.md",
+      line: 1,
+    };
+    const dryRun = (await executeAction(graph.plugin, "rewriteNativeLinks", { candidates: [candidate] })) as {
+      dryRun: boolean;
+      count: number;
+      remIds: string[];
+      blockedCount: number;
+    };
+    expect(dryRun).toMatchObject({ dryRun: true, count: 1, remIds: [source._id], blockedCount: 0 });
+
+    const rewritten = (await executeAction(graph.plugin, "rewriteNativeLinks", {
+      candidates: [candidate],
+      confirm: true,
+      opId: "op-links",
+    })) as { count: number; undoRecord: unknown };
+    expect(rewritten.count).toBe(1);
+    expect(source.text).toBe(`Read ${graph.reference(target._id)} today`);
+
+    await executeAction(graph.plugin, "undo", { undoRecord: rewritten.undoRecord });
+    expect(source.text).toBe("Read Target Concept today");
+  });
+
+  it("rewrites raw links directly inside structured rich-text nodes", async () => {
+    const graph = new FakeRemGraph();
+    const target = await graph.createChild(graph.root, "Target Concept");
+    const source = await graph.createChild(graph.root, "");
+    (source as unknown as { text: unknown }).text = [{ text: "Read Target Concept today" }];
+
+    const rewritten = (await executeAction(graph.plugin, "rewriteNativeLinks", {
+      candidates: [{ sourceNodeId: source._id, targetRemId: target._id, raw: "Target Concept" }],
+      confirm: true,
+      skipUndoRecord: true,
+    })) as { count: number; undoSkipped: boolean };
+
+    expect(rewritten).toMatchObject({ count: 1, undoSkipped: true });
+    expect(source.text).toBe(`Read ${graph.reference(target._id)} today`);
+    expect(graph.replaceAllRichTextCalls).toBe(0);
+  });
+
+  it("blocks native link rewrites unless the current raw occurrence is unique", async () => {
+    const graph = new FakeRemGraph();
+    const target = await graph.createChild(graph.root, "Target");
+    const source = await graph.createChild(graph.root, "Target and Target");
+
+    const dryRun = (await executeAction(graph.plugin, "rewriteNativeLinks", {
+      candidates: [{ sourceNodeId: source._id, targetRemId: target._id, raw: "Target" }],
+    })) as { count: number; blockedCount: number; blocked: Array<{ reason: string }> };
+
+    expect(dryRun.count).toBe(0);
+    expect(dryRun.blockedCount).toBe(1);
+    expect(dryRun.blocked[0].reason).toBe("raw-link-not-single-occurrence-in-current-rem");
   });
 });
