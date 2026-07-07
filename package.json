@@ -1,7 +1,7 @@
 {
   "name": "remnote-connect",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Local RemNote bridge for CLI, scripts, and LLM agents.",
   "type": "module",
   "packageManager": "pnpm@11.7.0",

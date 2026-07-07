@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+Marketplace packaging release.
+
+- Added a marketplace README to the plugin bundle so RemNote upload validation accepts the ZIP package.
+
 ## 0.3.1
 
 Maintenance release.
