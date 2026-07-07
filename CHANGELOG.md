@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+Maintenance release.
+
+- Updated TypeScript to 6.0.3.
+- Updated RemNoteConnect's direct Zod dependency to 4.4.3 and adjusted shared schemas for Zod 4.
+- Reverted incompatible Vite 8 and React DOM 19 dependency bumps to keep the public install compatible with the current RemNote SDK peer dependency graph.
+
 ## 0.3.0
 
 Initial public release.

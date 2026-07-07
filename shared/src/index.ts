@@ -1,10 +1,10 @@
 import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1;
-export const REMNOTE_CONNECT_VERSION = "0.3.0";
+export const REMNOTE_CONNECT_VERSION = "0.3.1";
 export const DAEMON_VERSION = REMNOTE_CONNECT_VERSION;
 export const PLUGIN_VERSION = REMNOTE_CONNECT_VERSION;
-export const BUILD_HASH = "public-v0.3.0";
+export const BUILD_HASH = "public-v0.3.1";
 export const DEFAULT_DAEMON_HOST = "127.0.0.1";
 export const DEFAULT_DAEMON_PORT = 8766;
 export const DEFAULT_DAEMON_URL = `http://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}`;
