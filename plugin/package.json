@@ -12,11 +12,11 @@
   "dependencies": {
     "@remnote/plugin-sdk": "0.0.46",
     "@remnoteconnect/shared": "workspace:*",
-    "react": "^17.0.2",
+    "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
-    "@types/react": "^17.0.88",
+    "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.6.0",
     "vite": "^8.1.3",
