@@ -1,5 +1,9 @@
 # RemNoteConnect
 
+[![CI](https://github.com/lucaschatham/remnoteconnect/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lucaschatham/remnoteconnect/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/lucaschatham/remnoteconnect)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/lucaschatham/remnoteconnect?label=release)](https://github.com/lucaschatham/remnoteconnect/releases)
+
 RemNoteConnect is local-first RemNote automation for learning workflows, with an LLM-friendly CLI.
 
 It lets terminal tools, scripts, and LLM agents work with your RemNote knowledge base through a small HTTP API and CLI. It is built for people who use RemNote as a learning system: capture notes, connect ideas, clean up messy imports, create flashcards, and review knowledge faster without giving a cloud service direct control of your database.
