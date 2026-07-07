@@ -41,11 +41,22 @@ jobs:
             echo "Private migration artifacts are tracked."
             exit 1
           fi
-          files="$(git ls-files)"
-          if [ -n "$files" ] && grep -RInE '/Users/HQ|Personal Obsidian|Lucas Paul Chatham|__codex|Documents/RemNoteConnect/Backups|840|753|476' $files; then
-            echo "Private path/content marker found in tracked files."
-            exit 1
-          fi
+          private_patterns=(
+            "/Users/"'HQ'
+            "Personal "'Obsidian'
+            "Lucas Paul "'Chatham'
+            "__co"'dex'
+            "Documents/RemNoteConnect/"'Backups'
+            "8"'40'
+            "7"'53'
+            "4"'76'
+          )
+          for pattern in "${private_patterns[@]}"; do
+            if git grep -n -F -- "$pattern"; then
+              echo "Private path/content marker found in tracked files."
+              exit 1
+            fi
+          done
 
       - name: Package script integrity
         run: |

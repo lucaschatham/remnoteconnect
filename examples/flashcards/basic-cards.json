@@ -1,0 +1,32 @@
+{
+  "deckPath": "RemNoteConnect Examples/Flashcards",
+  "batchId": "example-basic-cards",
+  "cards": [
+    {
+      "front": "What is active recall?",
+      "back": "A study method where you retrieve an answer from memory before checking the source.",
+      "tags": ["example", "learning"]
+    },
+    {
+      "front": "What should each strong flashcard test?",
+      "back": "One atomic idea, with enough context to answer it unambiguously.",
+      "tags": ["example", "flashcards"]
+    },
+    {
+      "front": "Why should cleanup operations start with a dry-run?",
+      "back": "A dry-run exposes the exact target set before any broad graph mutation occurs.",
+      "tags": ["example", "safety"]
+    },
+    {
+      "front": "Spaced repetition is most useful when cards are {{c1::atomic}} and reviewed consistently.",
+      "back": "Cloze-style cards can be useful for concise facts, formulas, or missing terms.",
+      "type": "cloze",
+      "tags": ["example", "cloze"]
+    },
+    {
+      "front": "List three checks before allowing an LLM to write to RemNote.",
+      "back": "Confirm the bridge status, inspect the target Rem/query, and review a dry-run or exact-count summary.",
+      "tags": ["example", "agent-safety"]
+    }
+  ]
+}
