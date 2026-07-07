@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { assert, call, cleanupByText, requireBridge } from "./live-helpers.mjs";
 
-const runId = `__codex_readonly__-${Date.now().toString(36)}`;
+const runId = `__rnc_readonly__-${Date.now().toString(36)}`;
 let priorReadonly = false;
 
 async function setReadonly(mode) {

@@ -46,7 +46,7 @@ describe("plugin executor", () => {
 
   it("runs capability probes with explicit unsupported rows and tombstone cleanup metadata", async () => {
     const graph = new FakeRemGraph();
-    const dryRun = (await executeAction(graph.plugin, "capabilityProbes", { runId: "__codex_probe__unit" })) as {
+    const dryRun = (await executeAction(graph.plugin, "capabilityProbes", { runId: "__rnc_probe__unit" })) as {
       dryRun: boolean;
       probes: string[];
     };
@@ -54,7 +54,7 @@ describe("plugin executor", () => {
     expect(dryRun.probes).toContain("image occlusion scriptability");
 
     const result = (await executeAction(graph.plugin, "capabilityProbes", {
-      runId: "__codex_probe__unit",
+      runId: "__rnc_probe__unit",
       confirm: true,
       materializeTimeoutMs: 0,
     })) as {
@@ -64,12 +64,12 @@ describe("plugin executor", () => {
       undoRecord: unknown;
     };
 
-    expect(result.runId).toBe("__codex_probe__unit");
+    expect(result.runId).toBe("__rnc_probe__unit");
     expect(result.capabilities.map((row) => row.capability)).toEqual(
       expect.arrayContaining(["frontBackCard", "imageOcclusion", "orderedInsertion", "driftPrimitives"]),
     );
     expect(result.capabilities.find((row) => row.capability === "imageOcclusion")?.status).toBe("UNSUPPORTED");
-    expect(result.cleanup.opId).toBe("__codex_probe__unit-tombstone");
+    expect(result.cleanup.opId).toBe("__rnc_probe__unit-tombstone");
     const tombstones = (await executeAction(graph.plugin, "listTombstones", {})) as { count: number };
     expect(tombstones.count).toBe(1);
   });

@@ -3,7 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { call, cleanupByText, emptyTrashOpId, requireBridge } from "./live-helpers.mjs";
 
-const runId = `__codex_probe__-${Date.now().toString(36)}`;
+const runId = `__rnc_probe__-${Date.now().toString(36)}`;
 const reportPath = join(process.cwd(), "docs", "capability-report.md");
 
 function statusIcon(status) {

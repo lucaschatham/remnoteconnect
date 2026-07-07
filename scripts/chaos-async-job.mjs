@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { assert, call, cleanupByText, url } from "./live-helpers.mjs";
 
 const root = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
-const runId = `__codex_async__-${Date.now().toString(36)}`;
+const runId = `__rnc_async__-${Date.now().toString(36)}`;
 const logDir = join(homedir(), "Library", "Logs", "RemNoteConnect");
 mkdirSync(logDir, { recursive: true });
 const out = createWriteStream(join(logDir, "chaos-async-job.out.log"), { flags: "a" });

@@ -630,7 +630,7 @@ async function rewriteNativeLinks(plugin: ReactRNPlugin, params: Record<string, 
     rewritten,
     undoRecord,
     undoSkipped: skipUndoRecord,
-    warning: skipUndoRecord ? "Undo record skipped for approved native-link migration to avoid oversized rich-text payloads." : undefined,
+    warning: skipUndoRecord ? "Undo record skipped for approved native-link rewrite to avoid oversized rich-text payloads." : undefined,
   };
 }
 
@@ -1182,7 +1182,7 @@ async function richTextProbeRead(plugin: ReactRNPlugin, rem: RemObject): Promise
 }
 
 async function runCapabilityProbes(plugin: ReactRNPlugin, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const runId = str(params.runId) ?? `__codex_probe__-${Date.now().toString(36)}`;
+  const runId = str(params.runId) ?? `__rnc_probe__-${Date.now().toString(36)}`;
   if (params.dryRun === true || params.confirm !== true) {
     return {
       dryRun: true,
@@ -1201,7 +1201,7 @@ async function runCapabilityProbes(plugin: ReactRNPlugin, params: Record<string,
         "drift primitives",
         "media data URI",
       ],
-      warning: "capabilityProbes creates disposable __codex_probe__ Rems and tombstones them. Pass confirm:true to execute.",
+      warning: "capabilityProbes creates disposable __rnc_probe__ Rems and tombstones them. Pass confirm:true to execute.",
     };
   }
 
@@ -1441,13 +1441,13 @@ async function runCapabilityProbes(plugin: ReactRNPlugin, params: Record<string,
 }
 
 async function runAnkiMigrationProbes(plugin: ReactRNPlugin, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const runId = str(params.runId) ?? `__codex_anki_probe__-${Date.now().toString(36)}`;
+  const runId = str(params.runId) ?? `__rnc_anki_probe__-${Date.now().toString(36)}`;
   if (params.dryRun === true || params.confirm !== true) {
     return {
       dryRun: true,
       runId,
       probes: ["cloze materialization", "parseAndInsertHtml", "media rich text serialization", "deck leaf as document"],
-      warning: "ankiMigrationProbes creates disposable __codex_ Rems and tombstones them. Pass confirm:true to execute.",
+      warning: "ankiMigrationProbes creates disposable __rnc_ Rems and tombstones them. Pass confirm:true to execute.",
     };
   }
 
@@ -2091,11 +2091,11 @@ export function capabilityMatrix(): Record<string, unknown> {
     queryGrammar: ["deck:<path>", "tag:<tag>", "text:<text>", "id:<remId>"],
     operationalRoot: MANAGED_ROOT_NAME,
     safetyModel: "whole-kb with tombstone + daemon undo store",
-    migrationFeatures: {
+    contentFeatures: {
       parseAndInsertHtml: true,
       clozeWrite: true,
       mediaPipeline: "daemon-local-url",
-      noteTypeMapping: "scripts/anki-migrate.mjs",
+      noteTypeMapping: "native RemNote card actions",
       finalAsDocument: true,
     },
   };

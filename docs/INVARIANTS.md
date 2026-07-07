@@ -63,6 +63,6 @@ Use compact outputs by default:
 
 ## Tests
 
-Definition of done includes happy paths, negative paths, and idempotent cleanup. Live tests must use disposable `__codex_*` names and leave the RemNote graph as they found it.
+Definition of done includes happy paths, negative paths, and idempotent cleanup. Live tests must use disposable `__rnc_*` names and leave the RemNote graph as they found it.
 
 Live operations must gate on `status.bridge.connected === true`, not daemon health alone. Exactly one plugin bridge connection is expected; reconnects cancel in-flight jobs.

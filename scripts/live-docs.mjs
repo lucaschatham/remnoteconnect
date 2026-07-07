@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { assert, call, cleanupByText, requireBridge } from "./live-helpers.mjs";
 
-const runId = `__codex_docs__-${Date.now().toString(36)}`;
+const runId = `__rnc_docs__-${Date.now().toString(36)}`;
 
 try {
   await requireBridge();

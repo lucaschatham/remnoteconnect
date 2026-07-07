@@ -15,7 +15,7 @@ Use this before pushing RemNoteConnect to a public GitHub repository.
 - daemon token files
 - `~/Library/Application Support/RemNoteConnect`
 - `~/Library/Logs/RemNoteConnect`
-- `~/Documents/RemNoteConnect/Backups`
+- local backup directories under `~/Documents`
 - plugin-local token config
 - private RemNote exports
 - Obsidian migration reports
@@ -23,18 +23,18 @@ Use this before pushing RemNoteConnect to a public GitHub repository.
 - graph maps containing personal note titles
 - logs containing local file paths or personal source snippets
 
-## Current Public-Readiness Notes
+## Public Branch Shape
 
-This working tree currently contains local migration tooling and generated artifacts. Treat the repo as not ready for public push until the private migration surface is either removed, ignored, or moved to a private branch.
+The public branch should contain only the reusable local bridge. Keep personal migrations, generated audit data, and one-off handoff documents in a private branch.
 
-Recommended public shape:
+Expected public shape:
 
 - keep `daemon/`
 - keep `plugin/`
 - keep `shared/`
 - keep generic live/security scripts
 - keep `README.md`, `docs/INVARIANTS.md`, and public docs
-- move private migration scripts and reports out of the public branch
+- move private migration scripts and reports out of the public branch before pushing
 
 Private/local-only examples include files named:
 

@@ -219,12 +219,12 @@ async function dispatchAction(
       magnitudeThreshold: MAGNITUDE_THRESHOLD,
       irreversibleSessionBudget: IRREVERSIBLE_SESSION_BUDGET,
       irreversibleReconfirmPhrase: IRREVERSIBLE_RECONFIRM_PHRASE,
-      migrationFeatures: {
+      contentFeatures: {
         durableAsync: true,
         parseAndInsertHtml: true,
         clozeWrite: true,
         mediaPipeline: "daemon-local-url",
-        noteTypeMapping: "scripts/anki-migrate.mjs",
+        noteTypeMapping: "native RemNote card actions",
         finalAsDocument: true,
       },
       daemonBuildHash: BUILD_HASH,

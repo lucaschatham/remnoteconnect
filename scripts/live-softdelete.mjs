@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { assert, call, cleanupByText, hardDeleteTestIds, requireBridge } from "./live-helpers.mjs";
 
-const runId = `__codex_softdelete__-${Date.now().toString(36)}`;
+const runId = `__rnc_softdelete__-${Date.now().toString(36)}`;
 
 try {
   await requireBridge();

@@ -95,7 +95,7 @@ Requirements:
 Install:
 
 ```sh
-git clone <your-remnoteconnect-repo-url>
+git clone https://github.com/lucaschatham/remnoteconnect.git
 cd RemNoteConnect
 npx pnpm@11.7.0 install
 npx pnpm@11.7.0 build
@@ -248,4 +248,4 @@ In particular, do not publish:
 
 ## License
 
-No open-source license has been selected yet. Until a license is added, the default copyright rules apply.
+MIT. See [LICENSE](LICENSE).

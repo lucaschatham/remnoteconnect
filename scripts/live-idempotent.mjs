@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { assert, call, cleanupByText, requireBridge } from "./live-helpers.mjs";
 
-const runId = `__codex_idempotent__-${Date.now().toString(36)}`;
+const runId = `__rnc_idempotent__-${Date.now().toString(36)}`;
 const externalId = `live:${runId}`;
 const documentExternalId = `live-doc:${runId}`;
 

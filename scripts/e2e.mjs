@@ -10,7 +10,7 @@ const tokenPath =
 const token = process.env.REMNOTE_CONNECT_TOKEN ?? readFileSync(tokenPath, "utf8").trim();
 const url = process.env.REMNOTE_CONNECT_URL ?? "http://127.0.0.1:8766";
 
-const runId = `__codex_e2e__-${Date.now().toString(36)}`;
+const runId = `__rnc_e2e__-${Date.now().toString(36)}`;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -61,7 +61,7 @@ try {
     deckPath: runId,
     front,
     back,
-    tags: ["codex-e2e"],
+    tags: ["rnc-e2e"],
     batchId: runId,
   });
 

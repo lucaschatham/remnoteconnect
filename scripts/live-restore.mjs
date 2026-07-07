@@ -9,7 +9,7 @@ const tokenPath =
   join(homedir(), "Library", "Application Support", "RemNoteConnect", "token");
 const token = process.env.REMNOTE_CONNECT_TOKEN ?? readFileSync(tokenPath, "utf8").trim();
 const url = process.env.REMNOTE_CONNECT_URL ?? "http://127.0.0.1:8766";
-const runId = `__codex_restore__-${Date.now().toString(36)}`;
+const runId = `__rnc_restore__-${Date.now().toString(36)}`;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -41,7 +41,7 @@ try {
 
   const front = `Restore front ${runId}`;
   const back = `Restore back ${runId}`;
-  const created = await call("createFlashcard", { deckPath: runId, front, back, batchId: runId, tags: ["codex-restore"] });
+  const created = await call("createFlashcard", { deckPath: runId, front, back, batchId: runId, tags: ["rnc-restore"] });
 
   const snapshot = await call("exportSubtree", { id: created.id });
   assert(snapshot.nodeCount === 1, "exportSubtree did not snapshot one Rem.");

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { assert, call, cleanupByText, emptyTrashOpId, requireBridge } from "./live-helpers.mjs";
 
-const runId = `__codex_cardtypes__-${Date.now().toString(36)}`;
+const runId = `__rnc_cardtypes__-${Date.now().toString(36)}`;
 
 function byCapability(result, name) {
   return (result.capabilities ?? []).find((row) => row.capability === name);
