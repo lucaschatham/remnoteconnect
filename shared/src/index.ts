@@ -15,7 +15,7 @@ export const IRREVERSIBLE_RECONFIRM_PHRASE = "I understand irreversible RemNote 
 export const ApiEnvelopeSchema = z.object({
   action: z.string().min(1),
   version: z.number().int().positive().optional().default(PROTOCOL_VERSION),
-  params: z.record(z.unknown()).optional().default({}),
+  params: z.record(z.string(), z.unknown()).optional().default({}),
 });
 
 export type ApiEnvelope = z.infer<typeof ApiEnvelopeSchema>;
@@ -56,7 +56,7 @@ export const PluginJobSchema = z.object({
   type: z.literal("job"),
   jobId: z.string(),
   action: z.string(),
-  params: z.record(z.unknown()).optional().default({}),
+  params: z.record(z.string(), z.unknown()).optional().default({}),
 });
 
 export type PluginJob = z.infer<typeof PluginJobSchema>;
@@ -67,7 +67,7 @@ export const PluginHelloSchema = z.object({
   pluginVersion: z.string().optional(),
   pluginBuildHash: z.string().optional(),
   transport: z.literal("websocket").default("websocket"),
-  capabilities: z.record(z.unknown()).optional(),
+  capabilities: z.record(z.string(), z.unknown()).optional(),
 });
 
 export type PluginHello = z.infer<typeof PluginHelloSchema>;
