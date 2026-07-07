@@ -1,10 +1,10 @@
 # RemNoteConnect
 
-RemNoteConnect is a local bridge that lets terminal tools, scripts, and LLM agents work with your RemNote knowledge base through a small HTTP API and CLI.
+RemNoteConnect is local-first RemNote automation for learning workflows, with an LLM-friendly CLI.
 
-It is built for people who use RemNote as a learning system: capture notes, connect ideas, clean up messy imports, create flashcards, and review knowledge faster without giving a cloud service direct control of your database.
+It lets terminal tools, scripts, and LLM agents work with your RemNote knowledge base through a small HTTP API and CLI. It is built for people who use RemNote as a learning system: capture notes, connect ideas, clean up messy imports, create flashcards, and review knowledge faster without giving a cloud service direct control of your database.
 
-> Status: experimental local-first tooling. It is not affiliated with RemNote.
+> Status: experimental local-first tooling. It is MIT open source, but the npm package is intentionally marked `"private": true` because npm distribution is not supported yet. It is not affiliated with RemNote.
 
 ## Why This Exists
 
@@ -85,6 +85,8 @@ Read [docs/INVARIANTS.md](docs/INVARIANTS.md) before using this against a real k
 
 ## Quickstart
 
+Before installing, understand the permission model: RemNoteConnect can request whole-knowledge-base access from RemNote desktop. Start in read-only mode, use dry-runs before broad cleanup, and read [docs/SAFE_USAGE.md](docs/SAFE_USAGE.md) before running writes against a real graph.
+
 Requirements:
 
 - macOS
@@ -96,7 +98,7 @@ Install:
 
 ```sh
 git clone https://github.com/lucaschatham/remnoteconnect.git
-cd RemNoteConnect
+cd remnoteconnect
 npx pnpm@11.7.0 install
 npx pnpm@11.7.0 build
 ```
@@ -200,6 +202,23 @@ See [docs/LEARNING_WORKFLOWS.md](docs/LEARNING_WORKFLOWS.md) for practical patte
 - cleaning up a messy graph
 - using RemNoteConnect with an LLM agent
 
+## Maturity
+
+Stable in v0.3:
+
+- local daemon and RemNote plugin bridge
+- CLI and HTTP action envelope
+- read-only mode, dry-runs, and exact-count approval guards
+- basic document, flashcard, search, map, and cleanup workflows
+
+Experimental in v0.3:
+
+- image occlusion and advanced media workflows
+- scheduler mutation
+- semantic search sidecars
+- RemNote marketplace packaging
+- cross-platform packaging beyond local Mac usage
+
 ## Verification
 
 Static checks:
@@ -245,6 +264,13 @@ In particular, do not publish:
 - Whole-graph operations require care. Use `readonly on`, dry-runs, and exact-count approvals.
 - Some RemNote features depend on what the Plugin SDK exposes.
 - Image occlusion and advanced media workflows should be treated as experimental until verified against your RemNote version.
+
+## More Docs
+
+- [Safe usage](docs/SAFE_USAGE.md)
+- [Threat model](docs/THREAT_MODEL.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Roadmap](docs/ROADMAP.md)
 
 ## License
 
