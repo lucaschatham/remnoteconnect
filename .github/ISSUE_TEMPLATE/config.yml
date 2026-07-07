@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security issue
+    url: https://github.com/lucaschatham/remnoteconnect/security/advisories/new
+    about: Report daemon token exposure, local access vulnerabilities, or private-data leakage privately.

@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a reproducible RemNoteConnect problem without sharing private graph data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste daemon tokens, private note text, RemNote exports, backups, graph maps, or screenshots containing private content.
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS version
+    validations:
+      required: true
+  - type: input
+    id: remnote
+    attributes:
+      label: RemNote desktop version
+      placeholder: RemNote version if known
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      placeholder: node --version
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or workflow
+      description: Include the command or workflow that failed. Redact private paths and content.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Prefer sanitized `doctor` or `status` output. Remove tokens and private note content.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Use disposable Rem or generic examples whenever possible.
+    validations:
+      required: true

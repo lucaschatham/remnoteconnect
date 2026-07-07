@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest a workflow or capability for RemNoteConnect.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the workflow without sharing private note text, exports, tokens, or graph data.
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Workflow goal
+      description: What learning or RemNote workflow should become easier?
+    validations:
+      required: true
+  - type: textarea
+    id: remnote
+    attributes:
+      label: RemNote feature involved
+      description: For example flashcards, references, portals, properties, documents, scheduler, media, or search.
+  - type: textarea
+    id: cli
+    attributes:
+      label: Desired CLI/API shape
+      description: Optional. Include command or action examples if you already know what you want.
+      render: sh
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety implications
+      description: Could this read, write, move, delete, or rewrite broad graph content?
+    validations:
+      required: true
