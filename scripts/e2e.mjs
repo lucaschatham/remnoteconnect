@@ -11,6 +11,7 @@ const token = process.env.REMNOTE_CONNECT_TOKEN ?? readFileSync(tokenPath, "utf8
 const url = process.env.REMNOTE_CONNECT_URL ?? "http://127.0.0.1:8766";
 
 const runId = `__rnc_e2e__-${Date.now().toString(36)}`;
+let priorReadonly = true;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -45,6 +46,7 @@ async function pollBridgeConnected() {
 
 async function cleanup() {
   try {
+    await call("readonly", { mode: "off" });
     const residue = await call("searchGraph", { query: `text:"${runId}"` });
     await hardDeleteTestIds(residue.remIds ?? residue.ids ?? [], `${runId}-cleanup`);
   } catch {
@@ -53,7 +55,9 @@ async function cleanup() {
 }
 
 try {
-  await pollBridgeConnected();
+  const status = await pollBridgeConnected();
+  priorReadonly = status.readonlyMode === true;
+  await call("readonly", { mode: "off" });
 
   const front = `Codex E2E front ${runId}`;
   const back = `Codex E2E back ${runId}`;
@@ -75,12 +79,13 @@ try {
   const byText = await call("searchFlashcards", { query: `text:"${front}"` });
   assert(byText.remIds.includes(created.id), "searchFlashcards text query did not include the created card");
 
+  await call("readonly", { mode: "off" });
   const dryRun = await call("deleteRem", { id: created.id });
   assert(dryRun.dryRun === true && dryRun.count === 1 && dryRun.remIds.includes(created.id), "deleteRem default dry-run did not return the exact target");
 
-  const deleted = await call("deleteRem", { id: created.id, confirm: true, opId: `${runId}-delete` });
+  const deleted = await call("deleteRem", { id: created.id, confirm: true });
   assert(deleted.count === 1 && deleted.remIds.includes(created.id), "deleteRem confirm did not tombstone the exact target");
-  assert(deleted.undo?.opId === `${runId}-delete`, "delete response did not include stored undo metadata");
+  assert(typeof deleted.undo?.opId === "string" && deleted.undo.opId.length > 0, "delete response did not include a daemon-owned undo operation ID");
 
   const undo = await call("undo", { opId: deleted.undo.opId });
   assert(undo.restored.includes(created.id), "undo did not restore the soft-deleted Rem");
@@ -88,6 +93,7 @@ try {
   await cleanup();
   const residue = await call("searchGraph", { query: `text:"${runId}"` });
   assert(residue.count === 0, "E2E disposable residue remains after cleanup");
+  if (priorReadonly) await call("readonly", { mode: "on" });
 
   console.log(
     JSON.stringify(
@@ -103,6 +109,7 @@ try {
   );
 } catch (error) {
   await cleanup();
+  if (priorReadonly) await call("readonly", { mode: "on" }).catch(() => undefined);
   console.error(JSON.stringify({ status: "FAIL", runId, message: error instanceof Error ? error.message : String(error) }, null, 2));
   process.exitCode = 1;
 }

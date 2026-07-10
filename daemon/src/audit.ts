@@ -7,7 +7,7 @@ export type AuditEvent = {
   action: string;
   targetIds: string[];
   count?: number;
-  status: "dry_run" | "success" | "error";
+  status: "prepared" | "dry_run" | "success" | "outcome_unknown" | "error";
   durationMs?: number;
   errorCode?: string;
 };

@@ -9,7 +9,6 @@ const TOKEN_STORAGE_KEY = "remnoteconnect.daemonToken";
 
 const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {};
 const ENV_DAEMON_URL = env.VITE_REMNOTE_CONNECT_DAEMON_URL;
-const ENV_TOKEN = env.VITE_REMNOTE_CONNECT_TOKEN;
 
 type HealthState = {
   connected: boolean;
@@ -28,6 +27,7 @@ export class BridgeClient {
   private reconnectTimer?: number;
   private heartbeatTimer?: number;
   private reconnectDelayMs = 500;
+  private bridgeGeneration?: number;
   private health: HealthState = {
     connected: false,
     tokenPresent: false,
@@ -74,7 +74,7 @@ export class BridgeClient {
     const url = (await this.plugin.settings.getSetting<string>(DAEMON_URL_SETTING)) || ENV_DAEMON_URL || DEFAULT_BRIDGE_URL;
     const storage = window.localStorage as Storage | undefined;
     const storedToken = typeof storage?.getItem === "function" ? storage.getItem(TOKEN_STORAGE_KEY) || "" : "";
-    const token = storedToken || (await this.plugin.settings.getSetting<string>(TOKEN_SETTING)) || ENV_TOKEN || "";
+    const token = storedToken || (await this.plugin.settings.getSetting<string>(TOKEN_SETTING)) || "";
     this.health.tokenPresent = Boolean(token);
     this.health.lastError = undefined;
     this.renderHealth();
@@ -173,8 +173,10 @@ export class BridgeClient {
       jobId?: string;
       action?: string;
       params?: Record<string, unknown>;
+      bridgeGeneration?: number;
       daemonVersion?: string;
       daemonBuildHash?: string;
+      pairedToken?: string;
     };
     try {
       message = JSON.parse(raw);
@@ -182,9 +184,18 @@ export class BridgeClient {
       return;
     }
     if (message.type === "hello_ack") {
+      if (message.pairedToken) {
+        const storage = window.localStorage as Storage | undefined;
+        if (typeof storage?.setItem === "function") storage.setItem(TOKEN_STORAGE_KEY, message.pairedToken);
+        this.health.tokenPresent = true;
+        this.health.lastError = "Pairing complete; reconnecting with the stored daemon token.";
+        this.renderHealth();
+        return;
+      }
       this.health.connected = true;
       this.health.daemonVersion = message.daemonVersion;
       this.health.daemonBuildHash = message.daemonBuildHash;
+      this.bridgeGeneration = message.bridgeGeneration;
       this.health.lastError = undefined;
       this.renderHealth();
       void this.checkScopeApproval();
@@ -197,27 +208,35 @@ export class BridgeClient {
     }
     if (message.type !== "job" || !message.jobId || !message.action) return;
 
+    const responseSocket = this.socket;
+    const responseGeneration = message.bridgeGeneration;
+    if (!responseSocket || responseGeneration !== this.bridgeGeneration) return;
+
     this.health.activeJobs += 1;
     this.renderHealth();
     try {
       const result = await executeAction(this.plugin, message.action, message.params ?? {}, (completed, total, progressMessage) => {
-        this.socket?.send(
+        if (this.socket === responseSocket && this.bridgeGeneration === responseGeneration) responseSocket.send(
           JSON.stringify({
             type: "progress",
             jobId: message.jobId,
+            bridgeGeneration: responseGeneration,
             completed,
             total,
             message: progressMessage,
           }),
         );
       });
-      this.socket?.send(JSON.stringify({ type: "result", jobId: message.jobId, result, error: null }));
+      if (this.socket === responseSocket && this.bridgeGeneration === responseGeneration) {
+        responseSocket.send(JSON.stringify({ type: "result", jobId: message.jobId, bridgeGeneration: responseGeneration, result, error: null }));
+      }
     } catch (error) {
       const code = error instanceof PluginActionError ? error.code : "plugin_error";
-      this.socket?.send(
+      if (this.socket === responseSocket && this.bridgeGeneration === responseGeneration) responseSocket.send(
         JSON.stringify({
           type: "result",
           jobId: message.jobId,
+          bridgeGeneration: responseGeneration,
           result: null,
           error: {
             code,

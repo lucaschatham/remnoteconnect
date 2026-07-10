@@ -1,10 +1,8 @@
-import { createReadStream } from "node:fs";
-import { access, appendFile, mkdir, rename, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { createInterface } from "node:readline";
 
-export type DurableJobStatus = "queued" | "running" | "complete" | "error";
+export type DurableJobStatus = "queued" | "running" | "outcome_unknown" | "paused_readonly" | "complete" | "error" | "cancelled";
 
 export type DurableJobRecord = {
   schemaVersion: 1;
@@ -20,6 +18,9 @@ export type DurableJobRecord = {
   progress: Array<{ completed: number; total: number; message?: string; at: number }>;
   result?: Record<string, unknown>;
   error?: { code: string; message: string; details?: unknown };
+  activeItemIndex?: number;
+  activeExternalId?: string;
+  outcomeUnknownAt?: string;
 };
 
 export function jobStorePath(appDir: string): string {
@@ -94,11 +95,22 @@ async function readSnapshots(appDir: string, onSnapshot: (snapshot: Partial<Dura
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  const stream = createReadStream(file, { encoding: "utf8" });
-  const lines = createInterface({ input: stream, crlfDelay: Infinity });
-  for await (const line of lines) {
+  const lines = (await readFile(file, "utf8")).split("\n");
+  let lastContentIndex = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!lines[index].trim()) continue;
+    lastContentIndex = index;
+    break;
+  }
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     if (!line.trim()) continue;
-    onSnapshot(JSON.parse(line) as Partial<DurableJobRecord>);
+    try {
+      onSnapshot(JSON.parse(line) as Partial<DurableJobRecord>);
+    } catch (error) {
+      if (index === lastContentIndex) return;
+      throw error;
+    }
   }
 }
 
@@ -133,6 +145,18 @@ export async function compactDurableJobs(appDir: string): Promise<{ jobs: number
   const tmp = `${file}.${process.pid}.tmp`;
   const lines = [...jobs.values()].map((job) => `${JSON.stringify(snapshotForCompaction(job))}\n`).join("");
   await writeFile(tmp, lines, { mode: 0o600 });
+  const handle = await open(tmp, "r+");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await rename(tmp, file);
+  const directory = await open(appDir, "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
   return { jobs: jobs.size };
 }

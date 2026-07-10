@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { pluginActions } from "@remnoteconnect/shared";
 import { ankiNoteToFlashcard, executeAction } from "../src/executor.js";
 import { FakeRemGraph } from "./fakeRemGraph.js";
 
@@ -14,6 +16,25 @@ async function createCard(graph: FakeRemGraph, front = "front", deckPath = "Deck
 }
 
 describe("plugin executor", () => {
+  it("keeps registry plugin actions in one-to-one parity with executor cases", () => {
+    const source = readFileSync(new URL("../src/executor.ts", import.meta.url), "utf8");
+    const cases = new Set([...source.matchAll(/case\s+"([^"]+)"/g)].map((match) => match[1]));
+    expect(pluginActions.filter((action) => !cases.has(action))).toEqual([]);
+  });
+
+  it("keeps representative dry-run handlers mutation-free", async () => {
+    const graph = new FakeRemGraph();
+    const movable = await graph.createChild(graph.root, "Movable");
+    const before = [...graph.rems.keys()];
+    await executeAction(graph.plugin, "createFolder", { path: "Would Not Exist", dryRun: true });
+    await executeAction(graph.plugin, "createDocument", { markdown: "- Preview", parentPath: "Would Not Exist", dryRun: true });
+    await executeAction(graph.plugin, "moveRem", { id: movable._id, targetPath: "Would Not Exist", dryRun: true });
+    await executeAction(graph.plugin, "capabilityProbes", { dryRun: true });
+    await executeAction(graph.plugin, "ankiMigrationProbes", { dryRun: true });
+    expect([...graph.rems.keys()]).toEqual(before);
+    expect(movable.parent).toBe(graph.root._id);
+  });
+
   it("stores a rotated daemon token without returning it", async () => {
     const graph = new FakeRemGraph();
     const result = (await executeAction(graph.plugin, "setDaemonToken", { token: "replacement-token-value" })) as { stored: boolean; token?: string };
@@ -225,8 +246,12 @@ describe("plugin executor", () => {
     expect(restored.count).toBe(1);
     expect(restored.remIds[0]).not.toBe(card.id);
 
-    const answer = (await executeAction(graph.plugin, "answerCard", { cardId: card.cards[0].id, score: 2 })) as { id: string };
-    expect(answer.id).toBe(card.cards[0].id);
+    await expect(executeAction(graph.plugin, "answerCard", { cardId: card.cards[0].id, score: 2 })).rejects.toMatchObject({
+      code: "experimental_disabled",
+    });
+    await expect(executeAction(graph.plugin, "deleteFlashcards", { cardIds: [card.cards[0].id], confirm: true })).rejects.toMatchObject({
+      code: "experimental_disabled",
+    });
   });
 
   it("emits progress while building graph backups", async () => {
@@ -416,11 +441,16 @@ describe("plugin executor", () => {
     expect(deleted.opId).toBe("op-doc");
     const tombstones = (await executeAction(graph.plugin, "listTombstones", {})) as { count: number };
     expect(tombstones.count).toBe(1);
-    const emptyDryRun = (await executeAction(graph.plugin, "emptyTrash", {})) as { dryRun: boolean; count: number };
+    const emptyDryRun = (await executeAction(graph.plugin, "emptyTrash", {})) as { dryRun: boolean; count: number; remIds: string[] };
     expect(emptyDryRun.dryRun).toBe(true);
-    expect(emptyDryRun.count).toBe(1);
-    const emptied = (await executeAction(graph.plugin, "emptyTrash", { confirm: true, irreversibleVerified: true })) as { count: number };
-    expect(emptied.count).toBe(1);
+    expect(emptyDryRun.count).toBeGreaterThan(1);
+    expect(emptyDryRun.remIds).toEqual(expect.arrayContaining([createdDoc.id, docChildId]));
+    const emptied = (await executeAction(graph.plugin, "emptyTrash", {
+      confirm: true,
+      irreversibleVerified: true,
+      expectedTargetIds: emptyDryRun.remIds,
+    })) as { count: number };
+    expect(emptied.count).toBe(emptyDryRun.count);
     expect((await executeAction(graph.plugin, "listTombstones", {})) as { count: number }).toMatchObject({ count: 0 });
     expect(graph.rems.has(createdDoc.id)).toBe(false);
     if (docChildId) expect(graph.rems.has(docChildId)).toBe(false);
@@ -501,7 +531,7 @@ describe("plugin executor", () => {
     expect(messy.backText).toBe("  Back   text ");
   });
 
-  it("merges non-destructively by default and structurally with inverse-reference undo", async () => {
+  it("merges non-destructively by default and keeps structural merge disabled", async () => {
     const graph = new FakeRemGraph();
     const keeper = await graph.createChild(graph.root, "Keeper");
     const loser = await graph.createChild(graph.root, "Loser");
@@ -527,31 +557,16 @@ describe("plugin executor", () => {
     await executeAction(graph.plugin, "undo", { undoRecord: nonStructural.undoRecord });
     expect(loser.parent).toBe(graph.root._id);
 
-    const structural = (await executeAction(graph.plugin, "mergeRems", {
-      keepId: keeper._id,
-      mergeIds: [loser._id],
-      structural: true,
-      irreversibleVerified: true,
-      confirm: true,
-      opId: "op-merge-structural",
-    })) as {
-      undoRecord: { mergeInverseReferences: unknown[] };
-      movedChildIds: string[];
-      referenceRemIds: string[];
-    };
-    expect(child.parent).toBe(keeper._id);
-    expect(ref.text).toContain(graph.reference(keeper._id));
-    expect(ref.text).not.toContain(graph.reference(loser._id));
-    expect(loser.parent).not.toBe(graph.root._id);
-    expect(structural.movedChildIds).toEqual([child._id]);
-    expect(structural.referenceRemIds).toEqual([ref._id]);
-    expect(structural.undoRecord.mergeInverseReferences).toHaveLength(1);
-
-    await executeAction(graph.plugin, "undo", { undoRecord: structural.undoRecord });
-    expect(loser.parent).toBe(graph.root._id);
+    await expect(
+      executeAction(graph.plugin, "mergeRems", {
+        keepId: keeper._id,
+        mergeIds: [loser._id],
+        structural: true,
+        confirm: true,
+      }),
+    ).rejects.toMatchObject({ code: "experimental_disabled" });
     expect(child.parent).toBe(loser._id);
-    expect(ref.text).toContain(graph.reference(loser._id));
-    expect(ref.text).not.toContain(graph.reference(keeper._id));
+    expect(graph.richTextToString(ref.text)).toContain(graph.reference(loser._id));
   });
 
   it("rewrites verified raw links into native Rem references with undo", async () => {
@@ -581,7 +596,7 @@ describe("plugin executor", () => {
       opId: "op-links",
     })) as { count: number; undoRecord: unknown };
     expect(rewritten.count).toBe(1);
-    expect(source.text).toBe(`Read ${graph.reference(target._id)} today`);
+    expect(graph.richTextToString(source.text)).toBe(`Read ${graph.reference(target._id)} today`);
 
     await executeAction(graph.plugin, "undo", { undoRecord: rewritten.undoRecord });
     expect(source.text).toBe("Read Target Concept today");
@@ -596,11 +611,11 @@ describe("plugin executor", () => {
     const rewritten = (await executeAction(graph.plugin, "rewriteNativeLinks", {
       candidates: [{ sourceNodeId: source._id, targetRemId: target._id, raw: "Target Concept" }],
       confirm: true,
-      skipUndoRecord: true,
-    })) as { count: number; undoSkipped: boolean };
+    })) as { count: number; undoRecord: unknown };
 
-    expect(rewritten).toMatchObject({ count: 1, undoSkipped: true });
-    expect(source.text).toBe(`Read ${graph.reference(target._id)} today`);
+    expect(rewritten).toMatchObject({ count: 1 });
+    expect(rewritten.undoRecord).toBeTruthy();
+    expect(graph.richTextToString(source.text)).toBe(`Read ${graph.reference(target._id)} today`);
     expect(graph.replaceAllRichTextCalls).toBe(0);
   });
 
@@ -616,5 +631,128 @@ describe("plugin executor", () => {
     expect(dryRun.count).toBe(0);
     expect(dryRun.blockedCount).toBe(1);
     expect(dryRun.blocked[0].reason).toBe("raw-link-not-single-occurrence-in-current-rem");
+  });
+
+  it("prepares undo before mutation and rejects changed prepared targets", async () => {
+    const graph = new FakeRemGraph();
+    const target = await graph.createChild(graph.root, "Prepared target");
+    const prepared = (await executeAction(graph.plugin, "prepareMutation", {
+      action: "deleteRem",
+      opId: "prepared-op",
+      params: { id: target._id },
+    })) as { targetIds: string[]; fingerprints: unknown[]; undoRecord: { targets: unknown[] } };
+
+    expect(prepared.targetIds).toEqual([target._id]);
+    expect(prepared.undoRecord.targets).toHaveLength(1);
+    expect(target.parent).toBe(graph.root._id);
+
+    await expect(
+      executeAction(graph.plugin, "deleteRem", {
+        id: target._id,
+        confirm: true,
+        opId: "prepared-op",
+        undoPrepared: true,
+        expectedTargetIds: ["different-id"],
+      }),
+    ).rejects.toMatchObject({ code: "dry_run_mismatch" });
+    expect(target.parent).toBe(graph.root._id);
+
+    target.updatedAt += 100;
+    await expect(
+      executeAction(graph.plugin, "deleteRem", {
+        id: target._id,
+        confirm: true,
+        opId: "prepared-op",
+        undoPrepared: true,
+        expectedTargetIds: prepared.targetIds,
+        expectedFingerprints: prepared.fingerprints,
+      }),
+    ).rejects.toMatchObject({ code: "dry_run_mismatch" });
+  });
+
+  it("normalizes text leaves without flattening rich-text nodes", async () => {
+    const graph = new FakeRemGraph();
+    const target = await graph.createChild(graph.root, "");
+    const referenceNode = { i: "q", _id: "referenced-rem" };
+    const unsupportedNode = { type: "cloze", text: "  preserve   this  " };
+    target.text = [{ i: "m", text: "  Bold   words  ", b: true }, referenceNode, unsupportedNode];
+
+    const preview = (await executeAction(graph.plugin, "normalizeText", { id: target._id })) as {
+      remIds: string[];
+      changes: Array<{ beforeHash: string; afterHash: string; skipReasons: string[] }>;
+    };
+    expect(preview.changes[0].beforeHash).not.toBe(preview.changes[0].afterHash);
+    expect(preview.changes[0].skipReasons).toEqual(["unsupported_text_node:cloze"]);
+    await executeAction(graph.plugin, "normalizeText", {
+      id: target._id,
+      confirm: true,
+      expectedTargetIds: preview.remIds,
+      opId: "normalize-rich",
+    });
+
+    expect(target.text).toEqual([{ i: "m", text: "Bold words ", b: true }, referenceNode, unsupportedNode]);
+  });
+
+  it("restores snapshot tag associations when the tag still exists", async () => {
+    const graph = new FakeRemGraph();
+    const tag = graph.createTopLevel("Snapshot Tag");
+    const source = await graph.createChild(graph.root, "Tagged source");
+    await source.addTag(tag);
+    const snapshot = (await executeAction(graph.plugin, "exportSubtree", { id: source._id })) as {
+      nodes: Array<Record<string, unknown>>;
+    };
+    snapshot.nodes[0].powerupProperties = [{ powerupCode: "test-powerup", slot: "status", richText: "restored powerup" }];
+    snapshot.nodes[0].tagProperties = [{ propertyId: "property-1", richText: "restored tag property" }];
+    const restored = (await executeAction(graph.plugin, "importSnapshot", { snapshot, parentPath: "Restored tags" })) as { remIds: string[] };
+    const copy = graph.rems.get(restored.remIds[0]);
+    expect((await copy?.getTagRems())?.map((item) => item._id)).toContain(tag._id);
+    expect(copy?.powerupProperties.get("test-powerup:status")).toBe("restored powerup");
+    expect(copy?.tagProperties.get("property-1")).toBe("restored tag property");
+  });
+
+  it("rejects emptyTrash execution when descendants changed after preview", async () => {
+    const graph = new FakeRemGraph();
+    const target = await graph.createChild(graph.root, "Disposable");
+    await executeAction(graph.plugin, "deleteRem", { id: target._id, confirm: true, opId: "trash-race" });
+    const preview = (await executeAction(graph.plugin, "emptyTrash", { tombstoneOpId: "trash-race" })) as { remIds: string[] };
+    await graph.createChild(target, "Late descendant");
+
+    await expect(
+      executeAction(graph.plugin, "emptyTrash", {
+        tombstoneOpId: "trash-race",
+        confirm: true,
+        irreversibleVerified: true,
+        expectedTargetIds: preview.remIds,
+      }),
+    ).rejects.toMatchObject({ code: "dry_run_mismatch" });
+    expect(graph.rems.has(target._id)).toBe(true);
+  });
+
+  it("requires force before hard-deleting a tombstone with inbound references", async () => {
+    const graph = new FakeRemGraph();
+    const target = await graph.createChild(graph.root, "Referenced disposable");
+    await graph.createChild(graph.root, `See ${graph.reference(target._id)}`);
+    await executeAction(graph.plugin, "deleteRem", { id: target._id, confirm: true, opId: "trash-ref" });
+    const preview = (await executeAction(graph.plugin, "emptyTrash", { tombstoneOpId: "trash-ref" })) as {
+      remIds: string[];
+      inboundReferenceIds: string[];
+    };
+    expect(preview.inboundReferenceIds).toHaveLength(1);
+    await expect(
+      executeAction(graph.plugin, "emptyTrash", {
+        tombstoneOpId: "trash-ref",
+        confirm: true,
+        irreversibleVerified: true,
+        expectedTargetIds: preview.remIds,
+      }),
+    ).rejects.toMatchObject({ code: "forbidden_target" });
+    await executeAction(graph.plugin, "emptyTrash", {
+      tombstoneOpId: "trash-ref",
+      confirm: true,
+      irreversibleVerified: true,
+      expectedTargetIds: preview.remIds,
+      force: true,
+    });
+    expect(graph.rems.has(target._id)).toBe(false);
   });
 });

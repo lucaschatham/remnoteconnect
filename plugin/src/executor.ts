@@ -1,10 +1,12 @@
-import type { QueueInteractionScore, ReactRNPlugin, RichTextInterface } from "@remnote/plugin-sdk";
+import type { ReactRNPlugin, RichTextInterface } from "@remnote/plugin-sdk";
 import { MANAGED_ROOT_NAME, parseQuery, pluginActions, type CreateFlashcardParams } from "@remnoteconnect/shared";
 import type { RemObject } from "./sdkTypes.js";
+import { PluginActionError } from "./errors.js";
 import {
   addTags,
   allAccessibleRems,
   buildSnapshot,
+  ensureManagedRoot,
   ensurePath,
   findFlashcardRems,
   findGraphRems,
@@ -12,7 +14,6 @@ import {
   mapBounded,
   managedRems,
   requireAccessibleRem,
-  requireManagedRem,
   resolveTargets,
   restoreSnapshotNode,
   richTextToString,
@@ -111,8 +112,97 @@ type UndoRecord = {
   }>;
 };
 
-function normalizeWhitespace(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
+type RichTextNormalization = {
+  value: RichTextInterface | undefined;
+  changed: boolean;
+  skipReasons: string[];
+};
+
+function stableJson(value: unknown): string {
+  if (value === undefined) return "undefined";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+}
+
+function richTextHash(value: unknown): string {
+  const input = stableJson(value);
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function normalizeRichTextTree(value: RichTextInterface | undefined): RichTextNormalization {
+  let changed = false;
+  const skipReasons = new Set<string>();
+  const normalizeLeaf = (text: string): string => text.replace(/\s+/g, " ");
+  const visit = (node: unknown): unknown => {
+    if (typeof node === "string") {
+      const next = normalizeLeaf(node);
+      if (next !== node) changed = true;
+      return next;
+    }
+    if (Array.isArray(node)) return node.map(visit);
+    if (!node || typeof node !== "object") return node;
+    const record = node as Record<string, unknown>;
+    const next: Record<string, unknown> = { ...record };
+    const isTextNode = record.type === "text" || record.i === "m" || record.i === "n" || (record.type === undefined && record.i === undefined);
+    if (isTextNode && typeof record.text === "string") {
+      const text = normalizeLeaf(record.text);
+      if (text !== record.text) changed = true;
+      next.text = text;
+    } else if (typeof record.text === "string") {
+      skipReasons.add(`unsupported_text_node:${String(record.type ?? record.i ?? "unknown")}`);
+    }
+    for (const key of ["content", "children", "segments", "richText"]) {
+      if (Array.isArray(record[key])) next[key] = (record[key] as unknown[]).map(visit);
+    }
+    return next;
+  };
+  const trimEdge = (node: unknown, start: boolean): { value: unknown; found: boolean } => {
+    if (typeof node === "string") {
+      const next = start ? node.trimStart() : node.trimEnd();
+      if (next !== node) changed = true;
+      return { value: next, found: true };
+    }
+    if (Array.isArray(node)) {
+      const next = [...node];
+      const indexes = start ? [...next.keys()] : [...next.keys()].reverse();
+      for (const index of indexes) {
+        const trimmed = trimEdge(next[index], start);
+        next[index] = trimmed.value;
+        if (trimmed.found) return { value: next, found: true };
+      }
+      return { value: next, found: false };
+    }
+    if (!node || typeof node !== "object") return { value: node, found: false };
+    const record = node as Record<string, unknown>;
+    const isTextNode = record.type === "text" || record.i === "m" || record.i === "n" || (record.type === undefined && record.i === undefined);
+    if (isTextNode && typeof record.text === "string") {
+      const text = start ? record.text.trimStart() : record.text.trimEnd();
+      if (text !== record.text) changed = true;
+      return { value: { ...record, text }, found: true };
+    }
+    const keys = ["content", "children", "segments", "richText"].filter((key) => Array.isArray(record[key]));
+    const ordered = start ? keys : [...keys].reverse();
+    let next = record;
+    for (const key of ordered) {
+      const trimmed = trimEdge(next[key], start);
+      if (!trimmed.found) continue;
+      next = { ...next, [key]: trimmed.value };
+      return { value: next, found: true };
+    }
+    if (typeof record.i === "string" || typeof record.type === "string") return { value: next, found: true };
+    return { value: next, found: false };
+  };
+  const normalized = visit(value);
+  const startTrimmed = trimEdge(normalized, true).value;
+  const endTrimmed = trimEdge(startTrimmed, false).value;
+  return { value: endTrimmed as RichTextInterface | undefined, changed, skipReasons: [...skipReasons].sort() };
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -175,6 +265,103 @@ async function captureUndoRecord(action: string, opId: string, rems: RemObject[]
     action,
     createdAt: new Date().toISOString(),
     targets: await Promise.all(rems.map(captureUndoTarget)),
+  };
+}
+
+async function normalizableTargets(plugin: ReactRNPlugin, params: Record<string, unknown>): Promise<RemObject[]> {
+  const { rems } = await resolveTargets(plugin, params);
+  const includeBackText = params.includeBackText === true;
+  const targets: RemObject[] = [];
+  for (const rem of rems) {
+    const front = normalizeRichTextTree(rem.text);
+    const back = normalizeRichTextTree(rem.backText);
+    if (front.changed || (includeBackText && back.changed)) targets.push(rem);
+  }
+  return targets;
+}
+
+async function mutationTargets(plugin: ReactRNPlugin, action: string, params: Record<string, unknown>): Promise<RemObject[]> {
+  if (action === "normalizeText") return normalizableTargets(plugin, params);
+  if (action === "rewriteNativeLinks") {
+    const input = Array.isArray(params.candidates)
+      ? params.candidates
+      : Array.isArray(params.links)
+        ? params.links
+        : Array.isArray(params.rewrites)
+          ? params.rewrites
+          : [];
+    const evaluated = await evaluateNativeLinkCandidates(plugin, input);
+    return uniqueRems(evaluated.filter((item): item is NativeLinkReady => item.ok).map((item) => item.source));
+  }
+  if (action === "mergeRems") {
+    const keepId = str(params.keepId) ?? str(params.keeperId);
+    const mergeIds = new Set<string>();
+    for (const key of ["mergeIds", "remIds", "ids"]) {
+      const value = params[key];
+      if (Array.isArray(value)) value.forEach((id) => typeof id === "string" && id !== keepId && mergeIds.add(id));
+    }
+    if (typeof params.mergeId === "string" && params.mergeId !== keepId) mergeIds.add(params.mergeId);
+    return (await Promise.all([...mergeIds].map((id) => plugin.rem.findOne(id)))).filter((rem): rem is RemObject => Boolean(rem));
+  }
+  const { rems } = await resolveTargets(plugin, params);
+  return uniqueRems(rems);
+}
+
+function assertExpectedTargetIds(actual: RemObject[], expected: unknown): void {
+  if (!Array.isArray(expected)) return;
+  const actualIds = actual.map((rem) => rem._id).sort();
+  const expectedIds = expected.filter((id): id is string => typeof id === "string").sort();
+  if (actualIds.length !== expectedIds.length || actualIds.some((id, index) => id !== expectedIds[index])) {
+    throw new PluginActionError("dry_run_mismatch", "Mutation targets changed after preparation.", { expectedIds, actualIds });
+  }
+}
+
+async function assertExpectedFingerprints(actual: RemObject[], expected: unknown): Promise<void> {
+  if (!Array.isArray(expected)) return;
+  const expectedById = new Map(
+    expected
+      .map(asRecord)
+      .filter((item) => typeof item.id === "string")
+      .map((item) => [item.id as string, item]),
+  );
+  for (const rem of actual) {
+    const fingerprint = expectedById.get(rem._id);
+    if (!fingerprint) continue;
+    const actualSiblingIndex = await siblingIndex(rem);
+    if (
+      fingerprint.parentId !== rem.parent ||
+      (fingerprint.siblingIndex !== undefined && Number(fingerprint.siblingIndex) !== actualSiblingIndex) ||
+      (fingerprint.updatedAt !== undefined && Number(fingerprint.updatedAt) !== Number(rem.updatedAt))
+    ) {
+      throw new PluginActionError("dry_run_mismatch", `Rem ${rem._id} changed after preparation.`, {
+        expected: fingerprint,
+        actual: { id: rem._id, parentId: rem.parent, siblingIndex: actualSiblingIndex, updatedAt: rem.updatedAt },
+      });
+    }
+  }
+}
+
+async function assertPreparedTargets(actual: RemObject[], params: Record<string, unknown>): Promise<void> {
+  assertExpectedTargetIds(actual, params.expectedTargetIds);
+  await assertExpectedFingerprints(actual, params.expectedFingerprints);
+}
+
+async function prepareMutation(plugin: ReactRNPlugin, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const action = str(params.action);
+  const opId = str(params.opId);
+  const actionParams = asRecord(params.params);
+  if (!action || !opId) throw new Error("prepareMutation requires daemon-generated action and opId.");
+  const targets = await mutationTargets(plugin, action, actionParams);
+  const undoRecord = await captureUndoRecord(action, opId, targets);
+  return {
+    opId,
+    action,
+    count: targets.length,
+    targetIds: targets.map((rem) => rem._id).sort(),
+    fingerprints: await Promise.all(
+      targets.map(async (rem) => ({ id: rem._id, parentId: rem.parent, siblingIndex: await siblingIndex(rem), updatedAt: rem.updatedAt })),
+    ),
+    undoRecord,
   };
 }
 
@@ -252,6 +439,7 @@ function isEmptyTrashMetadataContainer(info: { childCount: number; visibleChildC
 
 async function softDeleteRems(plugin: ReactRNPlugin, action: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
   const { rems } = await resolveTargets(plugin, params);
+  await assertPreparedTargets(rems, params);
   const opId = str(params.opId) ?? newOpId();
   const remIds = rems.map((rem) => rem._id);
   if (params.dryRun === true || params.confirm !== true) {
@@ -263,7 +451,7 @@ async function softDeleteRems(plugin: ReactRNPlugin, action: string, params: Rec
       warning: params.confirm === true ? undefined : `${action} defaults to dry-run. Pass confirm:true to tombstone targets.`,
     };
   }
-  const undoRecord = await captureUndoRecord(action, opId, rems);
+  const undoRecord = params.undoPrepared === true ? undefined : await captureUndoRecord(action, opId, rems);
   const trash = await trashFolder(plugin, opId);
   for (const rem of rems) await rem.setParent(trash);
   return { opId, count: rems.length, remIds, undoRecord, tombstoneParentId: trash._id };
@@ -273,6 +461,7 @@ async function bulkMoveRems(plugin: ReactRNPlugin, params: Record<string, unknow
   const targetPath = str(params.targetPath) ?? str(params.parentPath) ?? str(params.deck) ?? str(params.deckName);
   if (!targetPath) throw new Error("bulkMove requires targetPath/parentPath/deck.");
   const { rems } = await resolveTargets(plugin, params);
+  await assertPreparedTargets(rems, params);
   const opId = str(params.opId) ?? newOpId();
   if (params.dryRun === true || params.confirm !== true) {
     return {
@@ -284,7 +473,7 @@ async function bulkMoveRems(plugin: ReactRNPlugin, params: Record<string, unknow
       warning: params.confirm === true ? undefined : "bulkMove defaults to dry-run. Pass confirm:true to move targets.",
     };
   }
-  const undoRecord = await captureUndoRecord("bulkMove", opId, rems);
+  const undoRecord = params.undoPrepared === true ? undefined : await captureUndoRecord("bulkMove", opId, rems);
   const target = await ensurePath(plugin, targetPath, MANAGED_ROOT_NAME, { finalAsFolder: true });
   for (const rem of rems) await rem.setParent(target);
   return { opId, count: rems.length, remIds: rems.map((rem) => rem._id), targetPath, undoRecord };
@@ -292,6 +481,7 @@ async function bulkMoveRems(plugin: ReactRNPlugin, params: Record<string, unknow
 
 async function bulkRetagRems(plugin: ReactRNPlugin, params: Record<string, unknown>): Promise<Record<string, unknown>> {
   const { rems } = await resolveTargets(plugin, params);
+  await assertPreparedTargets(rems, params);
   const opId = str(params.opId) ?? newOpId();
   const add = [...stringArray(params.addTags), ...stringArray(params.tags)];
   const remove = new Set([...stringArray(params.removeTags), ...stringArray(params.remove)].map((tag) => tag.trim().toLowerCase()).filter(Boolean));
@@ -307,7 +497,7 @@ async function bulkRetagRems(plugin: ReactRNPlugin, params: Record<string, unkno
       warning: params.confirm === true ? undefined : "bulkRetag defaults to dry-run. Pass confirm:true to retag targets.",
     };
   }
-  const undoRecord = await captureUndoRecord("bulkRetag", opId, rems);
+  const undoRecord = params.undoPrepared === true ? undefined : await captureUndoRecord("bulkRetag", opId, rems);
   for (const rem of rems) {
     if (remove.size > 0) {
       for (const tag of await rem.getTagRems()) {
@@ -321,15 +511,20 @@ async function bulkRetagRems(plugin: ReactRNPlugin, params: Record<string, unkno
 }
 
 async function normalizeTextRems(plugin: ReactRNPlugin, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const { rems } = await resolveTargets(plugin, params);
+  const targets = await normalizableTargets(plugin, params);
+  await assertPreparedTargets(targets, params);
   const includeBackText = params.includeBackText === true;
-  const targets: RemObject[] = [];
-  for (const rem of rems) {
-    const text = await richTextToString(plugin, rem.text);
-    const backText = await richTextToString(plugin, rem.backText);
-    if (normalizeWhitespace(text) !== text || (includeBackText && normalizeWhitespace(backText) !== backText)) targets.push(rem);
-  }
   const opId = str(params.opId) ?? newOpId();
+  const changes = targets.map((rem) => {
+    const front = normalizeRichTextTree(rem.text);
+    const back = normalizeRichTextTree(rem.backText);
+    return {
+      id: rem._id,
+      beforeHash: richTextHash({ text: rem.text, backText: includeBackText ? rem.backText : undefined }),
+      afterHash: richTextHash({ text: front.value, backText: includeBackText ? back.value : undefined }),
+      skipReasons: [...new Set([...front.skipReasons, ...(includeBackText ? back.skipReasons : [])])].sort(),
+    };
+  });
   if (params.dryRun === true || params.confirm !== true) {
     return {
       dryRun: true,
@@ -337,15 +532,18 @@ async function normalizeTextRems(plugin: ReactRNPlugin, params: Record<string, u
       count: targets.length,
       remIds: targets.map((rem) => rem._id),
       includeBackText,
+      changes,
       warning: params.confirm === true ? undefined : "normalizeText defaults to dry-run. Pass confirm:true to normalize targets.",
     };
   }
-  const undoRecord = await captureUndoRecord("normalizeText", opId, targets);
+  const undoRecord = params.undoPrepared === true ? undefined : await captureUndoRecord("normalizeText", opId, targets);
   for (const rem of targets) {
-    await rem.setText(await toRichText(plugin, normalizeWhitespace(await richTextToString(plugin, rem.text))));
-    if (includeBackText) await rem.setBackText(await toRichText(plugin, normalizeWhitespace(await richTextToString(plugin, rem.backText))));
+    const front = normalizeRichTextTree(rem.text);
+    const back = normalizeRichTextTree(rem.backText);
+    if (front.changed && front.value !== undefined) await rem.setText(front.value);
+    if (includeBackText && back.changed && back.value !== undefined) await rem.setBackText(back.value);
   }
-  return { opId, count: targets.length, remIds: targets.map((rem) => rem._id), undoRecord };
+  return { opId, count: targets.length, remIds: targets.map((rem) => rem._id), changes, undoRecord };
 }
 
 type NativeLinkCandidate = {
@@ -566,7 +764,9 @@ async function rewriteNativeLinks(plugin: ReactRNPlugin, params: Record<string, 
   const evaluated = await evaluateNativeLinkCandidates(plugin, input);
   const ready = evaluated.filter((item): item is NativeLinkReady => item.ok);
   const blocked = evaluated.filter((item): item is NativeLinkBlocked => !item.ok);
-  const remIds = uniqueRems(ready.map((item) => item.source)).map((rem) => rem._id);
+  const affected = uniqueRems(ready.map((item) => item.source));
+  await assertPreparedTargets(affected, params);
+  const remIds = affected.map((rem) => rem._id);
   if (params.dryRun === true || params.confirm !== true) {
     return {
       dryRun: true,
@@ -581,9 +781,7 @@ async function rewriteNativeLinks(plugin: ReactRNPlugin, params: Record<string, 
   if (blocked.length > 0 && params.allowPartial !== true) {
     throw new Error(`rewriteNativeLinks has ${blocked.length} blocked candidates. Pass only ready candidates or allowPartial:true.`);
   }
-  const affected = uniqueRems(ready.map((item) => item.source));
-  const skipUndoRecord = params.skipUndoRecord === true;
-  const undoRecord = skipUndoRecord ? undefined : await captureUndoRecord("rewriteNativeLinks", opId, affected);
+  const undoRecord = params.undoPrepared === true ? undefined : await captureUndoRecord("rewriteNativeLinks", opId, affected);
   const rewritten: Array<Record<string, unknown>> = [];
   const readyBySource = new Map<string, NativeLinkReady[]>();
   for (const item of ready) {
@@ -629,8 +827,6 @@ async function rewriteNativeLinks(plugin: ReactRNPlugin, params: Record<string, 
     blockedCount: blocked.length,
     rewritten,
     undoRecord,
-    undoSkipped: skipUndoRecord,
-    warning: skipUndoRecord ? "Undo record skipped for approved native-link rewrite to avoid oversized rich-text payloads." : undefined,
   };
 }
 
@@ -666,6 +862,12 @@ async function mergeRems(plugin: ReactRNPlugin, params: Record<string, unknown>)
   if (typeof params.mergeId === "string" && params.mergeId !== keeper._id) mergeIds.add(params.mergeId);
   const losers = (await Promise.all([...mergeIds].map((id) => plugin.rem.findOne(id)))).filter((rem): rem is RemObject => Boolean(rem));
   const structural = params.structural === true;
+  if (structural) {
+    throw new PluginActionError(
+      "experimental_disabled",
+      "Structural merge is disabled until complete inbound-reference enumeration and merge-to-undo live verification are available.",
+    );
+  }
   const opId = str(params.opId) ?? newOpId();
   if (params.dryRun === true || params.confirm !== true) {
     let childCount = 0;
@@ -692,12 +894,9 @@ async function mergeRems(plugin: ReactRNPlugin, params: Record<string, unknown>)
     };
   }
 
-  if (structural && params.irreversibleVerified !== true) {
-    throw new Error("mergeRems structural mode requires daemon irreversible verification.");
-  }
-
   if (!structural) {
-    const undoRecord = await captureUndoRecord("mergeRems", opId, losers);
+    await assertPreparedTargets(losers, params);
+    const undoRecord = params.undoPrepared === true ? undefined : await captureUndoRecord("mergeRems", opId, losers);
     const trash = await trashFolder(plugin, opId);
     for (const loser of losers) {
       await loser.setBackText(await mergedIntoRichText(plugin, keeper));
@@ -706,52 +905,12 @@ async function mergeRems(plugin: ReactRNPlugin, params: Record<string, unknown>)
     return { opId, structural: false, keepId: keeper._id, count: losers.length, remIds: losers.map((rem) => rem._id), undoRecord };
   }
 
-  const movedChildren: RemObject[] = [];
-  const referenceRms: RemObject[] = [];
-  const inverseReferences: NonNullable<UndoRecord["mergeInverseReferences"]> = [];
-  for (const loser of losers) {
-    movedChildren.push(...(await loser.getChildrenRem()));
-    const refs = await loser.remsReferencingThis();
-    for (const ref of refs) {
-      if (ref._id === loser._id || ref._id === keeper._id) continue;
-      referenceRms.push(ref);
-      inverseReferences.push({
-        referencingRemId: ref._id,
-        fromRemId: loser._id,
-        toRemId: keeper._id,
-        richTextBefore: ref.text,
-        richBackTextBefore: ref.backText,
-      });
-    }
-  }
-  const affected = uniqueRems([...losers, ...movedChildren, ...referenceRms]);
-  const undoRecord = await captureMergeUndoRecord("mergeRems", opId, affected, inverseReferences);
-  for (const loser of losers) {
-    for (const ref of await loser.remsReferencingThis()) {
-      if (ref._id === loser._id || ref._id === keeper._id) continue;
-      const text = await replaceReference(plugin, ref.text, loser, keeper);
-      const backText = await replaceReference(plugin, ref.backText, loser, keeper);
-      if (text) await ref.setText(text);
-      if (backText) await ref.setBackText(backText);
-    }
-    for (const child of await loser.getChildrenRem()) await child.setParent(keeper);
-  }
-  const trash = await trashFolder(plugin, opId);
-  for (const loser of losers) await loser.setParent(trash);
-  return {
-    opId,
-    structural: true,
-    keepId: keeper._id,
-    count: losers.length,
-    remIds: losers.map((rem) => rem._id),
-    movedChildIds: movedChildren.map((rem) => rem._id),
-    referenceRemIds: uniqueRems(referenceRms).map((rem) => rem._id),
-    undoRecord,
-  };
+  throw new PluginActionError("experimental_disabled", "Structural merge is disabled in this build.");
 }
 
 async function setRemProperty(plugin: ReactRNPlugin, params: Record<string, unknown>): Promise<Record<string, unknown>> {
   const rem = await requireAccessibleRem(plugin, str(params.id) ?? str(params.remId), "Rem");
+  await assertPreparedTargets([rem], params);
   const opId = str(params.opId) ?? newOpId();
   const powerupCode = str(params.powerupCode) ?? str(params.powerup);
   const slot = str(params.slot) ?? str(params.property);
@@ -759,19 +918,19 @@ async function setRemProperty(plugin: ReactRNPlugin, params: Record<string, unkn
   if (!propertyId && (!powerupCode || !slot)) throw new Error("setProperty requires propertyId or powerupCode + slot.");
   if (params.dryRun === true) return { dryRun: true, opId, id: rem._id, powerupCode, slot, propertyId };
 
-  const target = await captureUndoTarget(rem);
+  const target = params.undoPrepared === true ? undefined : await captureUndoTarget(rem);
   if (propertyId) {
-    target.tagProperties = [{ propertyId, richText: await rem.getTagPropertyValue(propertyId) }];
+    if (target) target.tagProperties = [{ propertyId, richText: await rem.getTagPropertyValue(propertyId) }];
     await rem.setTagPropertyValue(propertyId, params.value === undefined ? undefined : await toRichText(plugin, params.value as string | unknown[] | Record<string, unknown>));
   } else if (powerupCode && slot) {
     await rem.addPowerup(powerupCode);
-    target.powerupProperties = [{ powerupCode, slot, richText: await rem.getPowerupPropertyAsRichText(powerupCode, slot) }];
+    if (target) target.powerupProperties = [{ powerupCode, slot, richText: await rem.getPowerupPropertyAsRichText(powerupCode, slot) }];
     await rem.setPowerupProperty(powerupCode, slot, await toRichText(plugin, params.value as string | unknown[] | Record<string, unknown>));
   }
   return {
     opId,
     id: rem._id,
-    undoRecord: { schemaVersion: 1, opId, action: "setProperty", createdAt: new Date().toISOString(), targets: [target] },
+    undoRecord: target ? { schemaVersion: 1, opId, action: "setProperty", createdAt: new Date().toISOString(), targets: [target] } : undefined,
   };
 }
 
@@ -974,6 +1133,47 @@ async function addExtraFields(plugin: ReactRNPlugin, rem: RemObject, fields: unk
 async function removeRemTree(rem: RemObject): Promise<void> {
   for (const child of await rem.getChildrenRem()) await removeRemTree(child);
   await rem.remove();
+}
+
+async function collectRemTree(rem: RemObject): Promise<RemObject[]> {
+  const descendants: RemObject[] = [rem];
+  for (const child of await rem.getChildrenRem()) descendants.push(...(await collectRemTree(child)));
+  return descendants;
+}
+
+async function exactTrashTargets(
+  plugin: ReactRNPlugin,
+  tombstoneOpId?: string,
+): Promise<{ roots: RemObject[]; rems: RemObject[]; inboundReferenceIds: string[] }> {
+  const trash = await trashFolder(plugin);
+  const children = await Promise.all((await trash.getChildrenRem()).map((rem) => trashChildInfo(plugin, rem)));
+  const roots: RemObject[] = [];
+  for (const info of children) {
+    if (isEmptyTrashMetadataContainer(info)) continue;
+    if (tombstoneOpId ? info.text === tombstoneOpId : !isTrashMetadataChild(info)) roots.push(info.rem);
+  }
+  const rems = uniqueRems((await Promise.all(roots.map(collectRemTree))).flat());
+  const targetIds = new Set(rems.map((rem) => rem._id));
+  const inboundReferenceIds = new Set<string>();
+  for (const rem of rems) {
+    for (const reference of await rem.remsReferencingThis()) {
+      if (!targetIds.has(reference._id)) inboundReferenceIds.add(reference._id);
+    }
+  }
+  return { roots, rems, inboundReferenceIds: [...inboundReferenceIds].sort() };
+}
+
+async function isUnderTrash(plugin: ReactRNPlugin, rem: RemObject): Promise<boolean> {
+  const trash = await trashFolder(plugin);
+  let current: RemObject | undefined = rem;
+  const seen = new Set<string>();
+  while (current) {
+    if (current._id === trash._id) return true;
+    if (seen.has(current._id)) return false;
+    seen.add(current._id);
+    current = await current.getParentRem();
+  }
+  return false;
 }
 
 async function createFlashcard(
@@ -1577,6 +1777,8 @@ export async function executeAction(
   progress?: ProgressFn,
 ): Promise<unknown> {
   switch (action) {
+    case "prepareMutation":
+      return prepareMutation(plugin, params);
     case "setDaemonToken": {
       const token = str(params.token);
       if (!token || token.length < 16) throw new Error("setDaemonToken requires a token.");
@@ -1625,9 +1827,17 @@ export async function executeAction(
         },
       };
     }
+    case "init": {
+      if (params.dryRun === true) return { dryRun: true, wouldCreate: `${MANAGED_ROOT_NAME}/Trash` };
+      const root = await ensureManagedRoot(plugin);
+      const trash = await trashFolder(plugin);
+      return { rootId: root._id, trashId: trash._id, count: 2 };
+    }
     case "capabilityProbes":
+      if (params.dryRun === true) return { dryRun: true, count: 0, wouldRun: "capabilityProbes" };
       return runCapabilityProbes(plugin, params);
     case "ankiMigrationProbes":
+      if (params.dryRun === true) return { dryRun: true, count: 0, wouldRun: "ankiMigrationProbes" };
       return runAnkiMigrationProbes(plugin, params);
     case "listRoots": {
       const root = await getManagedRoot(plugin);
@@ -1655,6 +1865,7 @@ export async function executeAction(
     case "createDeck": {
       const path = str(params.path) ?? str(params.deck) ?? str(params.deckName);
       if (!path) throw new Error("createFolder requires path.");
+      if (params.dryRun === true) return { dryRun: true, wouldCreatePath: path, count: 1 };
       const folder = await ensurePath(plugin, path, MANAGED_ROOT_NAME, {
         finalAsFolder: params.asDocument !== true,
         finalAsDocument: params.asDocument === true,
@@ -1662,7 +1873,9 @@ export async function executeAction(
       return mutationReturn(plugin, folder, params);
     }
     case "renameRem": {
-      const rem = await requireManagedRem(plugin, str(params.remId) ?? str(params.id), "Rem");
+      const rem = await requireAccessibleRem(plugin, str(params.remId) ?? str(params.id), "Rem");
+      await assertPreparedTargets([rem], params);
+      if (params.dryRun === true) return { dryRun: true, count: 1, remIds: [rem._id] };
       await rem.setText(await toRichText(plugin, str(params.text) ?? str(params.newName) ?? ""));
       return mutationReturn(plugin, rem, params);
     }
@@ -1670,8 +1883,8 @@ export async function executeAction(
     case "changeDeck": {
       const targetPath = str(params.targetPath) ?? str(params.deck) ?? str(params.deckName);
       if (!targetPath) throw new Error(`${action} requires targetPath/deck.`);
-      const target = await ensurePath(plugin, targetPath, MANAGED_ROOT_NAME, { finalAsFolder: true });
       const { rems } = await resolveTargets(plugin, params);
+      await assertPreparedTargets(rems, params);
       if (params.dryRun === true || params.confirm !== true) {
         return {
           dryRun: true,
@@ -1681,6 +1894,7 @@ export async function executeAction(
           warning: params.confirm === true ? undefined : `${action} defaults to dry-run. Pass confirm:true to move targets.`,
         };
       }
+      const target = await ensurePath(plugin, targetPath, MANAGED_ROOT_NAME, { finalAsFolder: true });
       for (const rem of rems) await rem.setParent(target);
       return { ...(await mutationListReturn(plugin, rems, params)), targetPath };
     }
@@ -1691,7 +1905,9 @@ export async function executeAction(
     case "createFlashcards":
       return createFlashcards(plugin, params, progress);
     case "updateFlashcard": {
-      const rem = await requireManagedRem(plugin, str(params.remId) ?? str(params.noteId) ?? str(params.id), "Flashcard Rem");
+      const rem = await requireAccessibleRem(plugin, str(params.remId) ?? str(params.noteId) ?? str(params.id), "Flashcard Rem");
+      await assertPreparedTargets([rem], params);
+      if (params.dryRun === true) return { dryRun: true, count: 1, remIds: [rem._id] };
       if (params.front !== undefined) await rem.setText(await toRichText(plugin, params.front as string | unknown[]));
       if (params.back !== undefined) await rem.setBackText(await toRichText(plugin, params.back as string | unknown[]));
       if (params.practiceDirection) await rem.setPracticeDirection(params.practiceDirection as "forward" | "backward" | "none" | "both");
@@ -1699,7 +1915,7 @@ export async function executeAction(
       return mutationReturn(plugin, rem, params);
     }
     case "getFlashcard": {
-      const rem = await requireManagedRem(plugin, str(params.remId) ?? str(params.noteId) ?? str(params.id), "Flashcard Rem");
+      const rem = await requireAccessibleRem(plugin, str(params.remId) ?? str(params.noteId) ?? str(params.id), "Flashcard Rem");
       return summarizeRem(plugin, rem);
     }
     case "searchFlashcards": {
@@ -1828,20 +2044,11 @@ export async function executeAction(
       return setRemProperty(plugin, params);
     case "getProperties":
       return getRemProperties(plugin, params);
-    case "deleteFlashcards": {
-      const { cards } = await resolveTargets(plugin, params);
-      if (params.dryRun === true || params.confirm !== true) {
-        return {
-          dryRun: true,
-          count: cards.length,
-          cardIds: cards.map((card) => card._id),
-          warning: params.confirm === true ? undefined : "deleteFlashcards defaults to dry-run. Pass confirm:true after daemon gating.",
-        };
-      }
-      if (params.irreversibleVerified !== true) throw new Error("deleteFlashcards requires daemon irreversible verification.");
-      for (const card of cards) await card.remove();
-      return { count: cards.length, cardIds: cards.map((card) => card._id) };
-    }
+    case "deleteFlashcards":
+      throw new PluginActionError(
+        "experimental_disabled",
+        "deleteFlashcards is disabled until complete scheduler state can be captured, restored, and live-tested.",
+      );
     case "addNote": {
       return createFlashcard(plugin, { ...ankiNoteToFlashcard(params.note ? asRecord(params.note) : params), existingRemId: params.existingRemId, verbose: params.verbose });
     }
@@ -1862,7 +2069,7 @@ export async function executeAction(
       const ids = stringArray(params.notes);
       const rems: RemObject[] = [];
       for (const id of ids) {
-        const rem = await requireManagedRem(plugin, id, "Note Rem");
+        const rem = await requireAccessibleRem(plugin, id, "Note Rem");
         rems.push(rem);
       }
       return Promise.all(rems.map((rem) => summarizeRem(plugin, rem)));
@@ -1906,49 +2113,70 @@ export async function executeAction(
       };
     }
     case "restoreTombstone": {
-      if (params.undoRecord) return executeAction(plugin, "undo", params, progress);
-      const target = await requireAccessibleRem(plugin, str(params.remId) ?? str(params.id), "Tombstone");
-      const parent = await ensurePath(plugin, str(params.parentPath), MANAGED_ROOT_NAME, { finalAsFolder: true });
-      await target.setParent(parent);
-      return { count: 1, remIds: [target._id] };
+      const undoRecord = asRecord(params.undoRecord) as Partial<UndoRecord>;
+      if (undoRecord.schemaVersion !== 1 || !Array.isArray(undoRecord.targets)) {
+        throw new PluginActionError("bad_request", "restoreTombstone requires a daemon-loaded undo record.");
+      }
+      for (const target of undoRecord.targets) {
+        const rem = await requireAccessibleRem(plugin, (target as UndoTarget).id, "Tombstone");
+        if (!(await isUnderTrash(plugin, rem))) {
+          throw new PluginActionError("forbidden_target", `Rem ${rem._id} is not currently under RemNoteConnect/Trash.`);
+        }
+      }
+      return executeAction(plugin, "undo", { undoRecord }, progress);
     }
     case "emptyTrash": {
-      const opId = str(params.opId);
-      const trash = await trashFolder(plugin);
-      const trashChildren = await Promise.all((await trash.getChildrenRem()).map((rem) => trashChildInfo(plugin, rem)));
-      const targets: RemObject[] = [];
-      for (const info of trashChildren) {
-        if (isEmptyTrashMetadataContainer(info)) continue;
-        if (opId ? info.text === opId : !isTrashMetadataChild(info)) targets.push(info.rem);
-      }
-      const remIds = targets.map((rem) => rem._id);
+      const tombstoneOpId = str(params.tombstoneOpId);
+      const targets = await exactTrashTargets(plugin, tombstoneOpId);
+      const remIds = targets.rems.map((rem) => rem._id).sort();
       if (params.dryRun === true || params.confirm !== true) {
         return {
           dryRun: true,
-          opId,
-          count: targets.length,
+          tombstoneOpId,
+          count: targets.rems.length,
           remIds,
+          rootIds: targets.roots.map((rem) => rem._id).sort(),
+          inboundReferenceIds: targets.inboundReferenceIds,
+          inboundReferenceCount: targets.inboundReferenceIds.length,
+          fingerprints: await Promise.all(
+            targets.rems.map(async (rem) => ({
+              id: rem._id,
+              parentId: rem.parent,
+              siblingIndex: await siblingIndex(rem),
+              updatedAt: rem.updatedAt,
+            })),
+          ),
           warning: "emptyTrash is irreversible. Execute only with daemon dry-run hash verification.",
         };
       }
       if (params.irreversibleVerified !== true) throw new Error("emptyTrash requires daemon irreversible verification.");
-      for (const rem of targets) await removeRemTree(rem);
-      return { opId, count: targets.length, remIds };
+      const expected = stringArray(params.expectedTargetIds).sort();
+      if (expected.length !== remIds.length || expected.some((id, index) => id !== remIds[index])) {
+        throw new PluginActionError("dry_run_mismatch", "Trash contents changed after dry-run.", { expected, actual: remIds });
+      }
+      await assertExpectedFingerprints(targets.rems, params.expectedFingerprints);
+      if (targets.inboundReferenceIds.length > 0 && params.force !== true) {
+        throw new PluginActionError("forbidden_target", "Trash contains Rem with inbound references. Pass force:true only after reviewing them.", {
+          inboundReferenceIds: targets.inboundReferenceIds,
+        });
+      }
+      for (const rem of targets.roots) await removeRemTree(rem);
+      return { tombstoneOpId, count: targets.rems.length, remIds, inboundReferenceIds: targets.inboundReferenceIds };
     }
     case "createDocument": {
       const markdown = str(params.markdown) ?? str(params.md) ?? "";
       const docSpec = asRecord(params.docSpec ?? params.document);
       const hasDocSpec = Object.keys(docSpec).length > 0;
       if (!markdown.trim() && !hasDocSpec) throw new Error("createDocument requires markdown/md or docSpec.");
-      const parent = await ensurePath(plugin, str(params.parentPath) ?? str(params.parent), MANAGED_ROOT_NAME, { finalAsFolder: true });
       if (params.dryRun === true) {
         return {
           dryRun: true,
-          parentId: parent._id,
+          parentPath: str(params.parentPath) ?? str(params.parent) ?? "",
           markdownBytes: markdown.length,
           docSpecNodes: hasDocSpec ? docSpecNodeCount(docSpec) : 0,
         };
       }
+      const parent = await ensurePath(plugin, str(params.parentPath) ?? str(params.parent), MANAGED_ROOT_NAME, { finalAsFolder: true });
       const existingRemId = str(params.existingRemId);
       const existing = existingRemId ? await plugin.rem.findOne(existingRemId) : undefined;
       if (existing) {
@@ -1975,6 +2203,7 @@ export async function executeAction(
       const hasDocSpec = Object.keys(docSpec).length > 0;
       if (!markdown.trim() && !hasDocSpec) throw new Error("appendToDocument requires markdown/md or docSpec.");
       const parent = await requireAccessibleRem(plugin, str(params.remId) ?? str(params.id), "Document");
+      await assertPreparedTargets([parent], params);
       const directChildrenOnly =
         hasDocSpec && !("text" in docSpec) && !("title" in docSpec) && !("richText" in docSpec) && !("backText" in docSpec) && Array.isArray(docSpec.children);
       const docSpecsToAppend = hasDocSpec ? (directChildrenOnly ? docSpecChildren(docSpec) : [docSpec]) : [];
@@ -2030,10 +2259,10 @@ export async function executeAction(
       return { count: duplicates.length, groups: duplicates };
     }
     case "answerCard": {
-      const card = await plugin.card.findOne(str(params.cardId));
-      if (!card) throw new Error("Card not found.");
-      await card.updateCardRepetitionStatus(Number(params.score ?? 1) as QueueInteractionScore);
-      return summarizeCard(card);
+      throw new PluginActionError(
+        "experimental_disabled",
+        "Scheduler mutation is disabled until complete scheduler state can be captured, restored, and live-tested.",
+      );
     }
     default: {
       const terms = parseQuery(str(params.query));

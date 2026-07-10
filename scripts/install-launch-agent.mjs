@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -11,6 +11,7 @@ const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
 const appDir = join(homedir(), "Library", "Application Support", "RemNoteConnect");
 const runtimeDir = join(appDir, "runtime");
 const node = process.env.NODE_BIN ?? defaultNodeBin();
+const pnpm = process.env.PNPM_BIN ?? "pnpm";
 const guiTarget = `gui/${process.getuid?.() ?? ""}/${label}`;
 
 function defaultNodeBin() {
@@ -61,26 +62,81 @@ function launchctl(args) {
 
 function installRuntime() {
   const pluginDist = join(root, "plugin", "dist");
+  const stagingDir = `${runtimeDir}.staging-${process.pid}`;
   if (!existsSync(pluginDist)) {
     console.error("plugin/dist is missing. Run `npx pnpm@11.7.0 -r build` before installing the LaunchAgent.");
     process.exit(1);
   }
-  rmSync(runtimeDir, { recursive: true, force: true });
+  rmSync(stagingDir, { recursive: true, force: true });
   mkdirSync(appDir, { recursive: true });
   const deployed = spawnSync(
-    "npx",
-    ["pnpm@11.7.0", "--config.confirmModulesPurge=false", "--filter", "@remnoteconnect/daemon", "deploy", "--legacy", "--prod", runtimeDir],
+    pnpm,
+    ["--config.confirmModulesPurge=false", "--filter", "@remnoteconnect/daemon", "deploy", "--legacy", stagingDir],
     { cwd: root, stdio: "inherit", env: { ...process.env, CI: "true", PNPM_CONFIG_CONFIRM_MODULES_PURGE: "false" } },
   );
-  if (deployed.status !== 0) process.exit(deployed.status ?? 1);
-  cpSync(pluginDist, join(runtimeDir, "plugin", "dist"), { recursive: true });
+  if (deployed.status !== 0) {
+    rmSync(stagingDir, { recursive: true, force: true });
+    if (deployed.error) console.error(`Failed to invoke pnpm at ${pnpm}: ${deployed.error.message}`);
+    process.exit(deployed.status ?? 1);
+  }
+  const packagePath = join(stagingDir, "package.json");
+  const deployedPackage = JSON.parse(readFileSync(packagePath, "utf8"));
+  const deployedShared = join(stagingDir, "node_modules", "@remnoteconnect", "shared");
+  const stagedShared = join(stagingDir, "shared");
+  cpSync(deployedShared, stagedShared, { recursive: true, dereference: true });
+  writeFileSync(
+    packagePath,
+    `${JSON.stringify(
+      {
+        name: deployedPackage.name,
+        version: deployedPackage.version,
+        private: true,
+        type: "module",
+        dependencies: { ...deployedPackage.dependencies, "@remnoteconnect/shared": "file:./shared" },
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  writeFileSync(join(stagingDir, "pnpm-workspace.yaml"), 'packages:\n  - "."\nallowBuilds:\n  esbuild: true\n', "utf8");
+  const pruned = spawnSync(
+    pnpm,
+    ["--dir", stagingDir, "prune", "--prod", "--ignore-scripts"],
+    { stdio: "inherit", env: { ...process.env, CI: "true", PNPM_CONFIG_CONFIRM_MODULES_PURGE: "false" } },
+  );
+  if (pruned.status !== 0) {
+    rmSync(stagingDir, { recursive: true, force: true });
+    if (pruned.error) console.error(`Failed to prune the staged runtime: ${pruned.error.message}`);
+    process.exit(pruned.status ?? 1);
+  }
+  for (const relative of ["src", "test", "tsconfig.json", "vitest.config.ts", "pnpm-workspace.yaml", "shared/src", "shared/tsconfig.json"]) {
+    rmSync(join(stagingDir, relative), { recursive: true, force: true });
+  }
+  cpSync(pluginDist, join(stagingDir, "plugin", "dist"), { recursive: true });
+  return stagingDir;
 }
 
 if (command === "install") {
-  installRuntime();
+  const stagingDir = installRuntime();
+  const previousDir = `${runtimeDir}.previous`;
   mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
   writeFileSync(plistPath, plist(), "utf8");
-  console.log(JSON.stringify({ status: "installed", plistPath, runtimeDir, load: `launchctl bootstrap gui/$(id -u) ${plistPath}` }, null, 2));
+  launchctl(["bootout", `gui/${process.getuid?.() ?? ""}`, plistPath]);
+  rmSync(previousDir, { recursive: true, force: true });
+  if (existsSync(runtimeDir)) renameSync(runtimeDir, previousDir);
+  renameSync(stagingDir, runtimeDir);
+
+  const loaded = launchctl(["bootstrap", `gui/${process.getuid?.() ?? ""}`, plistPath]);
+  if (loaded.status !== 0) {
+    rmSync(runtimeDir, { recursive: true, force: true });
+    if (existsSync(previousDir)) renameSync(previousDir, runtimeDir);
+    launchctl(["bootstrap", `gui/${process.getuid?.() ?? ""}`, plistPath]);
+    console.error(loaded.stderr || loaded.stdout || "Failed to start the RemNoteConnect LaunchAgent.");
+    process.exit(1);
+  }
+  rmSync(previousDir, { recursive: true, force: true });
+  console.log(JSON.stringify({ status: "installed", plistPath, runtimeDir, loaded: true }, null, 2));
 } else if (command === "check") {
   const result = launchctl(["print", guiTarget]);
   console.log(

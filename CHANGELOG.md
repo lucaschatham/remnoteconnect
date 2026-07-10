@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+Safety and reliability release.
+
+- Centralized registry-driven parameter validation, read-only enforcement, and machine-readable action schemas.
+- Added write-ahead undo with exclusive mode-`0600` records and explicit committed/outcome-unknown states.
+- Made hard-delete previews enumerate every descendant and inbound-reference risk.
+- Added five-minute, single-use irreversible approval nonces and an atomic three-operation session budget.
+- Disabled scheduler mutation, generated-card deletion, and structural merge until they can be proven reversible.
+- Prevented uncertain durable jobs from replaying after disconnects or restarts.
+- Added bridge generations, torn-JSONL recovery, local token pairing, and token-free plugin builds.
+- Preserved rich-text structure during normalization and restored available snapshot tag associations.
+- Added `rnc init`, registry help, irreversible approval commands, and universal `rnc call` coverage.
+
 ## 0.3.2
 
 Marketplace packaging release.

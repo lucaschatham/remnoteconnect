@@ -9,13 +9,14 @@ The plugin requests `All / ReadCreateModifyDelete`. Managed-root containment is 
 The load-bearing invariant is reversibility before capability:
 
 - Reversible operations mutate stable Rem IDs and can be undone through the daemon undo store.
+- Write-ahead undo state is flushed to disk before the first plugin mutation. A failed or disconnected prepared operation is marked `outcome_unknown`.
 - Soft delete means moving Rem to `RemNoteConnect/Trash/<opId>/`, not calling `rem.remove()`.
 - Undo restores the original parent and sibling index using `setParent(parent, positionAmongstSiblings)`.
 - Snapshot restore is disaster recovery only. It recreates copies with new IDs and does not preserve inbound references, portals, or scheduling history.
 
 The operational root `RemNoteConnect` still exists for bridge-owned folders such as `Trash` and `Tags`, but graph operations may target Rem outside that root.
 
-Read-only mode is daemon-enforced. When `readonly` is on, every action marked `mutates:true` in shared action metadata must fail with `readonly_mode` before it reaches the plugin or durable job queue. Read-only mode is for audit, mapping, and LLM inspection sessions; it is not a substitute for undo on write sessions.
+Read-only mode is daemon-enforced. When `readonly` is on, every action marked `mutates:true` must fail with `readonly_mode` before plugin dispatch, even if the caller claims `dryRun:true`. Queued durable writes become `paused_readonly`; `jobStatus` and `jobWait` never start work.
 
 ## Audit And Undo
 
@@ -32,9 +33,9 @@ Destructive, bulk, and graph-wide operations are dry-run-first. Execution requir
 
 If an operation resolves more than 50 targets, execution requires `confirmCount:<exactCount>`.
 
-Irreversible operations, currently `emptyTrash` and future structural merges, require `fromDryRun:<hash>` from a prior dry run. The daemon enforces an in-memory irreversible session budget of 3 operations.
+Irreversible operations require an unchanged `fromDryRun` hash, the exact recursive target count, and a five-minute single-use nonce created through an interactive CLI challenge. `emptyTrash` hashes every descendant and reports inbound references before deletion.
 
-When that budget is exhausted, the only valid reset path is `reconfirmIrreversibleBudget` with `confirm:true` and the exact human confirmation phrase. Do not raise the default budget or restart the daemon to bypass this gate during testing.
+The daemon enforces an atomic session budget of 3 irreversible attempts. Resetting it requires a separate TTY-issued single-use approval through `rnc reconfirm-irreversible`; no static confirmation phrase exists.
 
 No code path may call `rem.remove()` except the `emptyTrash` implementation.
 
@@ -48,7 +49,7 @@ Do not assume the connected plugin is the currently built plugin. The plugin mus
 
 ## Token Handling
 
-Never serve the daemon token with wildcard CORS, bake it into build artifacts, log it, or commit it. The CLI reads the token from the local token file; it is not accepted as a command-line argument.
+Never serve the daemon token with wildcard CORS, bake it into build artifacts, log it, or commit it. Initial setup uses a short-lived pairing code. The CLI reads the token from the local token file; it is not accepted as a command-line argument.
 
 Built artifacts and test fixtures must not contain 64-character hex tokens.
 
@@ -65,4 +66,4 @@ Use compact outputs by default:
 
 Definition of done includes happy paths, negative paths, and idempotent cleanup. Live tests must use disposable `__rnc_*` names and leave the RemNote graph as they found it.
 
-Live operations must gate on `status.bridge.connected === true`, not daemon health alone. Exactly one plugin bridge connection is expected; reconnects cancel in-flight jobs.
+Live operations must gate on `status.bridge.connected === true`, not daemon health alone. Exactly one plugin bridge connection is expected. A disconnect during a non-idempotent write produces `outcome_unknown`; it is never silently replayed.

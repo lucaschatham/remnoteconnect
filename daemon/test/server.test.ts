@@ -7,7 +7,8 @@ import { buildServer } from "../src/server.js";
 import { loadConfig } from "../src/config.js";
 import { startPluginStaticServer } from "../src/pluginStatic.js";
 import { BRIDGE_MAX_PAYLOAD_BYTES } from "../src/bridge.js";
-import { BUILD_HASH, IRREVERSIBLE_RECONFIRM_PHRASE } from "@remnoteconnect/shared";
+import { appendJobSnapshot, createDurableJob } from "../src/jobStore.js";
+import { BUILD_HASH, actionMetadata, hasExplicitActionParamSchema } from "@remnoteconnect/shared";
 
 function testBundle(options: { readonlyMode?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "remnote-connect-"));
@@ -69,6 +70,63 @@ async function eventually<T>(read: () => Promise<T>, accept: (value: T) => boole
     last = await read();
   }
   return last;
+}
+
+async function approvalNonce(
+  bundle: ReturnType<typeof testBundle>,
+  action: string,
+  fromDryRun: string,
+  confirmCount: number,
+): Promise<string> {
+  const challenge = await bundle.app.inject({
+    method: "POST",
+    url: "/",
+    headers: authHeaders,
+    payload: { action: "approveIrreversible", version: 1, params: { stage: "challenge", action, fromDryRun, confirmCount } },
+  });
+  const approved = await bundle.app.inject({
+    method: "POST",
+    url: "/",
+    headers: authHeaders,
+    payload: {
+      action: "approveIrreversible",
+      version: 1,
+      params: {
+        stage: "approve",
+        action,
+        fromDryRun,
+        confirmCount,
+        challengeId: challenge.json().result.challengeId,
+        response: challenge.json().result.phrase,
+      },
+    },
+  });
+  return approved.json().result.approvalNonce;
+}
+
+async function sessionResetNonce(bundle: ReturnType<typeof testBundle>): Promise<string> {
+  const challenge = await bundle.app.inject({
+    method: "POST",
+    url: "/",
+    headers: authHeaders,
+    payload: { action: "approveIrreversible", version: 1, params: { stage: "challenge", sessionReset: true } },
+  });
+  const approved = await bundle.app.inject({
+    method: "POST",
+    url: "/",
+    headers: authHeaders,
+    payload: {
+      action: "approveIrreversible",
+      version: 1,
+      params: {
+        stage: "approve",
+        sessionReset: true,
+        challengeId: challenge.json().result.challengeId,
+        response: challenge.json().result.phrase,
+      },
+    },
+  });
+  return approved.json().result.approvalNonce;
 }
 
 describe("daemon server", () => {
@@ -195,7 +253,17 @@ describe("daemon server", () => {
       mutates: true,
       reversible: true,
       magnitudeGuarded: true,
+      effect: "write",
+      dryRunBehavior: "required",
+      undoStrategy: "writeAhead",
     });
+    expect(describe.json().result.actions.deleteRem.paramsSchema).toMatchObject({ type: "object" });
+    for (const action of Object.values(describe.json().result.actions) as Array<{ implemented: boolean; paramsSchema?: { type?: string } }>) {
+      if (action.implemented) expect(action.paramsSchema?.type).toBe("object");
+    }
+    for (const meta of Object.values(actionMetadata).filter((candidate) => candidate.implemented)) {
+      expect(hasExplicitActionParamSchema(meta.name), `${meta.name} must have an explicit Zod parameter schema`).toBe(true);
+    }
 
     const planned = await bundle.app.inject({
       method: "POST",
@@ -204,6 +272,14 @@ describe("daemon server", () => {
       payload: { action: "updateDocument", version: 1, params: {} },
     });
     expect(planned.json().error.code).toBe("not_implemented");
+
+    const unsafe = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "deleteRem", version: 1, params: { id: "x", irreversibleVerified: true } },
+    });
+    expect(unsafe.json().error.code).toBe("unsafe_parameter");
   });
 
   it("toggles daemon-enforced read-only mode and blocks mutating plugin actions before dispatch", async () => {
@@ -243,6 +319,28 @@ describe("daemon server", () => {
     });
     expect(status.json().result.readonlyMode).toBe(true);
 
+    const validParamsByAction: Record<string, Record<string, unknown>> = {
+      createRem: { text: "blocked" },
+      createFolder: { path: "blocked" },
+      createFlashcards: { cards: [] },
+      createFlashcardsAsync: { cards: [] },
+      importSnapshot: { snapshot: {} },
+      answerCard: { cardId: "blocked", score: 2 },
+      addNotes: { notes: [] },
+      mergeRems: { keepId: "blocked" },
+      undo: { opId: "blocked" },
+    };
+    for (const meta of Object.values(actionMetadata).filter((candidate) => candidate.implemented && candidate.mutates)) {
+      const blocked = await bundle.app.inject({
+        method: "POST",
+        url: "/",
+        headers: authHeaders,
+        payload: { action: meta.name, version: 1, params: { dryRun: true, ...(validParamsByAction[meta.name] ?? {}) } },
+      });
+      expect(blocked.json().error?.code, `${meta.name} must be blocked before plugin dispatch`).toBe("readonly_mode");
+    }
+    expect(seenActions).toEqual([]);
+
     const read = await bundle.app.inject({
       method: "POST",
       url: "/",
@@ -266,8 +364,7 @@ describe("daemon server", () => {
       headers: authHeaders,
       payload: { action: "rewriteNativeLinks", version: 1, params: { dryRun: true, candidates: [{ sourceNodeId: "a", targetRemId: "b", raw: "B" }] } },
     });
-    expect(dryRunPluginMutation.json().error).toBeNull();
-    expect(dryRunPluginMutation.json().result).toMatchObject({ count: 0 });
+    expect(dryRunPluginMutation.json().error.code).toBe("readonly_mode");
 
     const blockedDaemonMutation = await bundle.app.inject({
       method: "POST",
@@ -276,7 +373,7 @@ describe("daemon server", () => {
       payload: { action: "createFlashcardsAsync", version: 1, params: { cards: [{ front: "A", back: "B" }], confirm: true } },
     });
     expect(blockedDaemonMutation.json().error.code).toBe("readonly_mode");
-    expect(seenActions).toEqual(["searchGraph", "rewriteNativeLinks"]);
+    expect(seenActions).toEqual(["searchGraph"]);
 
     const disabled = await bundle.app.inject({
       method: "POST",
@@ -293,7 +390,7 @@ describe("daemon server", () => {
       payload: { action: "createFlashcard", version: 1, params: { front: "A", back: "B" } },
     });
     expect(mutationAfterDisable.json().error).toBeNull();
-    expect(seenActions).toEqual(["searchGraph", "rewriteNativeLinks", "createFlashcard"]);
+    expect(seenActions).toEqual(["searchGraph", "createFlashcard"]);
     ws.close();
     await bundle.app.close();
   });
@@ -432,7 +529,37 @@ describe("daemon server", () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ result: { id: "rem-1", text: "front" }, error: null });
+    expect(response.json().error).toBeNull();
+    expect(response.json().result).toMatchObject({ id: "rem-1", text: "front" });
+    expect(response.json().result.opId).toMatch(/[0-9a-f-]{36}/);
+    expect(response.json().result.planHash).toMatch(/^[a-f0-9]{64}$/);
+    ws.close();
+    await bundle.app.close();
+  });
+
+  it("pairs a plugin with a short-lived single-use code without embedding the token", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    const issued = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "pair", version: 1, params: {} },
+    });
+    const code = issued.json().result.code;
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`, { headers: { origin: "http://127.0.0.1:8080" } });
+    const pairedToken = await new Promise<string>((resolve, reject) => {
+      ws.once("open", () => {
+        ws.send(JSON.stringify({ type: "hello", token: code, transport: "websocket" }));
+      });
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString("utf8"));
+        if (message.pairedToken) resolve(message.pairedToken);
+      });
+      ws.once("error", reject);
+    });
+    expect(pairedToken).toBe("test-token-test-token");
     ws.close();
     await bundle.app.close();
   });
@@ -702,6 +829,28 @@ describe("daemon server", () => {
     await bundle.app.close();
   });
 
+  it("reports outcome_unknown instead of encouraging replay after a dispatched write disconnects", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    const plugin = connectPlugin(port, {
+      onJob(message, socket) {
+        if (message.action === "createFlashcard") socket.close();
+      },
+    });
+    await plugin.ready;
+    const response = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "createFlashcard", version: 1, params: { front: "Unknown", back: "Outcome" } },
+    });
+    expect(response.json().error.code).toBe("outcome_unknown");
+    expect(response.json().error.details.opId).toMatch(/[0-9a-f-]{36}/);
+    expect(readFileSync(join(bundle.config.logDir, "audit.jsonl"), "utf8")).toContain('"status":"outcome_unknown"');
+    await bundle.app.close();
+  });
+
   it("runs durable async flashcard jobs and confirms materialized ids", async () => {
     const bundle = testBundle();
     dirs.push(bundle.dir);
@@ -774,6 +923,57 @@ describe("daemon server", () => {
     await bundle.app.close();
   });
 
+  it("keeps queued durable writes paused while read-only mode is enabled", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    const queued = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "createFlashcardsAsync", version: 1, params: { confirm: true, cards: [{ front: "A", back: "B" }] } },
+    });
+    const jobId = queued.json().result.jobId;
+    await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "readonly", version: 1, params: { mode: "on" } },
+    });
+
+    let dispatched = 0;
+    const plugin = connectPlugin(port, {
+      onJob(message, socket) {
+        dispatched += 1;
+        socket.send(JSON.stringify({ type: "result", jobId: message.jobId, result: { id: "paused-1" }, error: null }));
+      },
+    });
+    await plugin.ready;
+    const paused = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "jobStatus", version: 1, params: { jobId } },
+    });
+    expect(paused.json().result.status).toBe("paused_readonly");
+    expect(dispatched).toBe(0);
+
+    await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "readonly", version: 1, params: { mode: "off" } },
+    });
+    const completed = await eventually(
+      () => bundle.app.inject({ method: "POST", url: "/", headers: authHeaders, payload: { action: "jobStatus", version: 1, params: { jobId } } }),
+      (response) => response.json().result?.status === "complete",
+    );
+    expect(completed.json().result.ids).toEqual(["paused-1"]);
+    expect(dispatched).toBe(1);
+    plugin.ws.close();
+    await bundle.app.close();
+  });
+
   it("uses daemon externalId index for idempotent document reruns", async () => {
     const bundle = testBundle();
     dirs.push(bundle.dir);
@@ -826,7 +1026,7 @@ describe("daemon server", () => {
     await bundle.app.close();
   });
 
-  it("resumes durable async jobs from JSONL after a daemon restart", async () => {
+  it("does not replay a durable item whose outcome became uncertain", async () => {
     const first = testBundle();
     dirs.push(first.dir);
     const firstPort = await listen(first);
@@ -867,7 +1067,7 @@ describe("daemon server", () => {
       },
     });
     const jobId = queued.json().result.jobId;
-    const queuedStatus = await eventually(
+    const uncertainStatus = await eventually(
       async () =>
         first.app.inject({
           method: "POST",
@@ -875,16 +1075,18 @@ describe("daemon server", () => {
           headers: authHeaders,
           payload: { action: "jobStatus", version: 1, params: { jobId } },
         }),
-      (response) => response.json().result?.status === "queued" && response.json().result?.cursor === 1,
+      (response) => response.json().result?.status === "outcome_unknown" && response.json().result?.cursor === 1,
     );
-    expect(queuedStatus.json().result).toMatchObject({ status: "queued", cursor: 1, ids: ["resume-1"] });
+    expect(uncertainStatus.json().result).toMatchObject({ status: "outcome_unknown", cursor: 1, ids: ["resume-1"], activeItemIndex: 1 });
     firstPlugin.ws.close();
     await first.app.close();
 
     const second = buildServer(first.config);
     const secondPort = await listen(second as ReturnType<typeof testBundle>);
+    let replayed = 0;
     const secondPlugin = connectPlugin(secondPort, {
       onJob(message, socket) {
+        replayed += 1;
         socket.send(JSON.stringify({ type: "result", jobId: message.jobId, result: { id: "resume-2" }, error: null }));
       },
     });
@@ -896,9 +1098,60 @@ describe("daemon server", () => {
       headers: authHeaders,
       payload: { action: "jobWait", version: 1, params: { jobId, timeoutMs: 5000 } },
     });
-    expect(waited.json().result).toMatchObject({ status: "complete", cursor: 2, ids: ["resume-1", "resume-2"] });
+    expect(waited.json().result).toMatchObject({ status: "outcome_unknown", cursor: 1, ids: ["resume-1"] });
+    expect(replayed).toBe(0);
     secondPlugin.ws.close();
     await second.app.close();
+  });
+
+  it("resumes a durable job interrupted safely between items", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "remnote-connect-"));
+    dirs.push(dir);
+    const config = loadConfig({
+      appDir: join(dir, "app"),
+      backupDir: join(dir, "backups"),
+      tokenFile: join(dir, "app", "token"),
+      token: "test-token-test-token",
+      readonlyMode: false,
+    });
+    const job = createDurableJob(
+      "createFlashcardsAsync",
+      {
+        confirm: true,
+        cards: [
+          { front: "First", back: "One", externalId: "between-1" },
+          { front: "Second", back: "Two", externalId: "between-2" },
+        ],
+      },
+      2,
+    );
+    await appendJobSnapshot(config.appDir, job);
+    job.status = "running";
+    job.cursor = 1;
+    job.ids = ["between-id-1"];
+    await appendJobSnapshot(config.appDir, job);
+
+    const built = buildServer(config);
+    const bundle = { ...built, config, dir };
+
+    const port = await listen(bundle);
+    let dispatched = 0;
+    const plugin = connectPlugin(port, {
+      onJob(message, socket) {
+        dispatched += 1;
+        socket.send(JSON.stringify({ type: "result", jobId: message.jobId, result: { id: "between-id-2" }, error: null }));
+      },
+    });
+    await plugin.ready;
+
+    const completed = await eventually(
+      () => bundle.app.inject({ method: "POST", url: "/", headers: authHeaders, payload: { action: "jobStatus", version: 1, params: { jobId: job.jobId } } }),
+      (response) => response.json().result?.status === "complete",
+    );
+    expect(completed.json().result).toMatchObject({ status: "complete", cursor: 2, ids: ["between-id-1", "between-id-2"] });
+    expect(dispatched).toBe(1);
+    plugin.ws.close();
+    await bundle.app.close();
   });
 
   it("stores undo state and writes content-free audit for soft delete", async () => {
@@ -906,11 +1159,34 @@ describe("daemon server", () => {
     dirs.push(bundle.dir);
     const port = await listen(bundle);
     const seenActions: string[] = [];
+    let preparedOpId = "";
     const { ws, ready } = connectPlugin(port, {
       onJob(message, socket) {
         seenActions.push(message.action);
+        if (message.action === "prepareMutation") {
+          preparedOpId = String(message.params.opId);
+          expect(message.params.action).toBe("deleteRem");
+          socket.send(
+            JSON.stringify({
+              type: "result",
+              jobId: message.jobId,
+              result: {
+                targetIds: ["rem-1"],
+                count: 1,
+                undoRecord: {
+                  schemaVersion: 1,
+                  opId: preparedOpId,
+                  action: "deleteRem",
+                  createdAt: "2026-01-01T00:00:00.000Z",
+                  targets: [{ id: "rem-1", parentId: "parent-1", siblingIndex: 2, richText: "secret note body" }],
+                },
+              },
+              error: null,
+            }),
+          );
+          return;
+        }
         expect(message.action).toBe("deleteRem");
-        expect(message.params.backupVerified).toBeUndefined();
         if (message.params.dryRun === true || message.params.confirm !== true) {
           socket.send(
             JSON.stringify({
@@ -927,17 +1203,10 @@ describe("daemon server", () => {
             type: "result",
             jobId: message.jobId,
             result: {
-              opId: "op-soft-delete",
+              opId: message.params.opId,
               count: 1,
               remIds: ["rem-1"],
               tombstoneParentId: "trash-op",
-              undoRecord: {
-                schemaVersion: 1,
-                opId: "op-soft-delete",
-                action: "deleteRem",
-                createdAt: "2026-01-01T00:00:00.000Z",
-                targets: [{ id: "rem-1", parentId: "parent-1", siblingIndex: 2, richText: "secret note body" }],
-              },
             },
             error: null,
           }),
@@ -954,21 +1223,68 @@ describe("daemon server", () => {
     });
 
     expect(response.json().error).toBeNull();
-    expect(seenActions).toEqual(["deleteRem", "deleteRem"]);
-    expect(response.json().result.undo).toEqual({ opId: "op-soft-delete", targetCount: 1 });
+    expect(seenActions).toEqual(["deleteRem", "prepareMutation", "deleteRem"]);
+    expect(response.json().result.undo).toEqual({ opId: preparedOpId, targetCount: 1 });
     expect(response.json().result.undoRecord).toBeUndefined();
 
-    const undoPath = join(bundle.config.appDir, "undo", "op-soft-delete.json");
+    const undoPath = join(bundle.config.appDir, "undo", `${preparedOpId}.json`);
     expect(existsSync(undoPath)).toBe(true);
     expect(statSync(undoPath).mode & 0o777).toBe(0o600);
     expect(readFileSync(undoPath, "utf8")).toContain("secret note body");
 
     const auditPath = join(bundle.config.logDir, "audit.jsonl");
     const audit = readFileSync(auditPath, "utf8");
-    expect(audit).toContain("op-soft-delete");
+    expect(audit).toContain(preparedOpId);
     expect(audit).not.toContain("secret note body");
     ws.close();
     await bundle.app.close();
+  });
+
+  it("requires an exact dry-run and single-use approval before clearing undo records", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    const undoDir = join(bundle.config.appDir, "undo");
+    mkdirSync(undoDir, { recursive: true });
+    for (const opId of ["undo-a", "undo-b"]) {
+      writeFileSync(
+        join(undoDir, `${opId}.json`),
+        JSON.stringify({ schemaVersion: 1, opId, action: "test", createdAt: new Date().toISOString(), targets: [] }),
+        { mode: 0o600 },
+      );
+    }
+    const preview = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "undoClear", version: 1, params: {} },
+    });
+    expect(preview.json().result).toMatchObject({ dryRun: true, count: 2, opIds: ["undo-a", "undo-b"] });
+    const hash = preview.json().result.fromDryRun;
+    const nonce = await approvalNonce(bundle, "undoClear", hash, 2);
+    const cleared = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "undoClear",
+        version: 1,
+        params: { confirm: true, confirmCount: 2, fromDryRun: hash, approvalNonce: nonce },
+      },
+    });
+    expect(cleared.json().result).toMatchObject({ count: 2, opIds: ["undo-a", "undo-b"] });
+    expect(existsSync(join(undoDir, "undo-a.json"))).toBe(false);
+
+    const replay = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "undoClear",
+        version: 1,
+        params: { confirm: true, confirmCount: 2, fromDryRun: hash, approvalNonce: nonce },
+      },
+    });
+    expect(replay.json().error.code).toBe("dry_run_mismatch");
   });
 
   it("requires a prior dry-run hash before emptyTrash executes", async () => {
@@ -1015,15 +1331,49 @@ describe("daemon server", () => {
     expect(dryRun.json().error).toBeNull();
     expect(dryRun.json().result.fromDryRun).toBe(suggestedHash);
 
+    const missingApproval = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "emptyTrash",
+        version: 1,
+        params: { confirm: true, confirmCount: 1, fromDryRun: dryRun.json().result.fromDryRun },
+      },
+    });
+    expect(missingApproval.json().error.code).toBe("approval_required");
+    const nonce = await approvalNonce(bundle, "emptyTrash", dryRun.json().result.fromDryRun, 1);
+
     const executed = await bundle.app.inject({
       method: "POST",
       url: "/",
       headers: authHeaders,
-      payload: { action: "emptyTrash", version: 1, params: { confirm: true, fromDryRun: dryRun.json().result.fromDryRun } },
+      payload: {
+        action: "emptyTrash",
+        version: 1,
+        params: { confirm: true, confirmCount: 1, fromDryRun: dryRun.json().result.fromDryRun, approvalNonce: nonce },
+      },
     });
     expect(executed.json().error).toBeNull();
     expect(executed.json().result).toMatchObject({ count: 1, remIds: ["trash-1"] });
-    expect(seenActions).toEqual(["emptyTrash", "emptyTrash", "emptyTrash", "emptyTrash"]);
+    const replayPreview = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "emptyTrash", version: 1, params: {} },
+    });
+    const replay = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "emptyTrash",
+        version: 1,
+        params: { confirm: true, confirmCount: 1, fromDryRun: replayPreview.json().result.fromDryRun, approvalNonce: nonce },
+      },
+    });
+    expect(replay.json().error.code).toBe("approval_invalid");
+    expect(seenActions).toHaveLength(7);
     ws.close();
     await bundle.app.close();
   });
@@ -1052,29 +1402,41 @@ describe("daemon server", () => {
     });
     await ready;
 
-    const dryRun = await bundle.app.inject({
+    for (let i = 0; i < 3; i += 1) {
+      const dryRun = await bundle.app.inject({
+        method: "POST",
+        url: "/",
+        headers: authHeaders,
+        payload: { action: "emptyTrash", version: 1, params: {} },
+      });
+      const fromDryRun = dryRun.json().result.fromDryRun;
+      const nonce = await approvalNonce(bundle, "emptyTrash", fromDryRun, 1);
+      const executed = await bundle.app.inject({
+        method: "POST",
+        url: "/",
+        headers: authHeaders,
+        payload: { action: "emptyTrash", version: 1, params: { confirm: true, confirmCount: 1, fromDryRun, approvalNonce: nonce } },
+      });
+      expect(executed.json().error).toBeNull();
+    }
+
+    const exhaustedDryRun = await bundle.app.inject({
       method: "POST",
       url: "/",
       headers: authHeaders,
       payload: { action: "emptyTrash", version: 1, params: {} },
     });
-    const fromDryRun = dryRun.json().result.fromDryRun;
-
-    for (let i = 0; i < 3; i += 1) {
-      const executed = await bundle.app.inject({
-        method: "POST",
-        url: "/",
-        headers: authHeaders,
-        payload: { action: "emptyTrash", version: 1, params: { confirm: true, fromDryRun } },
-      });
-      expect(executed.json().error).toBeNull();
-    }
-
+    const exhaustedHash = exhaustedDryRun.json().result.fromDryRun;
+    const exhaustedNonce = await approvalNonce(bundle, "emptyTrash", exhaustedHash, 1);
     const exhausted = await bundle.app.inject({
       method: "POST",
       url: "/",
       headers: authHeaders,
-      payload: { action: "emptyTrash", version: 1, params: { confirm: true, fromDryRun } },
+      payload: {
+        action: "emptyTrash",
+        version: 1,
+        params: { confirm: true, confirmCount: 1, fromDryRun: exhaustedHash, approvalNonce: exhaustedNonce },
+      },
     });
     expect(exhausted.json().error.code).toBe("irreversible_budget_exceeded");
     expect(executedCount).toBe(3);
@@ -1083,10 +1445,11 @@ describe("daemon server", () => {
       method: "POST",
       url: "/",
       headers: authHeaders,
-      payload: { action: "reconfirmIrreversibleBudget", version: 1, params: { confirm: true, phrase: "reset it" } },
+      payload: { action: "reconfirmIrreversibleBudget", version: 1, params: { approvalNonce: "not-a-valid-approval" } },
     });
-    expect(rejectedReset.json().error.code).toBe("confirm_required");
+    expect(rejectedReset.json().error.code).toBe("approval_invalid");
 
+    const resetNonce = await sessionResetNonce(bundle);
     const reset = await bundle.app.inject({
       method: "POST",
       url: "/",
@@ -1094,17 +1457,29 @@ describe("daemon server", () => {
       payload: {
         action: "reconfirmIrreversibleBudget",
         version: 1,
-        params: { confirm: true, phrase: IRREVERSIBLE_RECONFIRM_PHRASE },
+        params: { approvalNonce: resetNonce },
       },
     });
     expect(reset.json().error).toBeNull();
     expect(reset.json().result.irreversibleRemaining).toBe(3);
 
+    const afterResetDryRun = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "emptyTrash", version: 1, params: {} },
+    });
+    const afterResetHash = afterResetDryRun.json().result.fromDryRun;
+    const afterResetNonce = await approvalNonce(bundle, "emptyTrash", afterResetHash, 1);
     const afterReset = await bundle.app.inject({
       method: "POST",
       url: "/",
       headers: authHeaders,
-      payload: { action: "emptyTrash", version: 1, params: { confirm: true, fromDryRun } },
+      payload: {
+        action: "emptyTrash",
+        version: 1,
+        params: { confirm: true, confirmCount: 1, fromDryRun: afterResetHash, approvalNonce: afterResetNonce },
+      },
     });
     expect(afterReset.json().error).toBeNull();
     expect(executedCount).toBe(4);
@@ -1113,7 +1488,25 @@ describe("daemon server", () => {
     await bundle.app.close();
   });
 
-  it("gates structural merge behind a prior dry-run hash while default merge stays reversible", async () => {
+  it("keeps scheduler mutation and generated-card deletion disabled", async () => {
+    const bundle = testBundle();
+    dirs.push(bundle.dir);
+    for (const [action, params] of [
+      ["answerCard", { cardId: "card-1", score: 2 }],
+      ["deleteFlashcards", { cardIds: ["card-1"], confirm: true }],
+    ] as const) {
+      const response = await bundle.app.inject({
+        method: "POST",
+        url: "/",
+        headers: authHeaders,
+        payload: { action, version: 1, params },
+      });
+      expect(response.json().error.code).toBe("experimental_disabled");
+    }
+    await bundle.app.close();
+  });
+
+  it("keeps structural merge disabled while default merge uses write-ahead undo", async () => {
     const bundle = testBundle();
     dirs.push(bundle.dir);
     const port = await listen(bundle);
@@ -1121,10 +1514,28 @@ describe("daemon server", () => {
     const { ws, ready } = connectPlugin(port, {
       onJob(message, socket) {
         seen.push({ action: message.action, params: message.params });
-        if (message.action !== "mergeRems") return;
-        if (message.params.structural === true && message.params.confirm === true) {
-          expect(message.params.irreversibleVerified).toBe(true);
+        if (message.action === "prepareMutation") {
+          socket.send(
+            JSON.stringify({
+              type: "result",
+              jobId: message.jobId,
+              result: {
+                targetIds: ["loser-1"],
+                count: 1,
+                undoRecord: {
+                  schemaVersion: 1,
+                  opId: message.params.opId,
+                  action: "mergeRems",
+                  createdAt: "2026-01-01T00:00:00.000Z",
+                  targets: [{ id: "loser-1", parentId: "parent-1", tagIds: [] }],
+                },
+              },
+              error: null,
+            }),
+          );
+          return;
         }
+        if (message.action !== "mergeRems") return;
         socket.send(
           JSON.stringify({
             type: "result",
@@ -1132,7 +1543,7 @@ describe("daemon server", () => {
             result:
               message.params.dryRun === true || message.params.confirm !== true
                 ? { dryRun: true, structural: message.params.structural === true, count: 1, remIds: ["loser-1"] }
-                : { opId: "op-merge", count: 1, remIds: ["loser-1"] },
+                : { opId: message.params.opId, count: 1, remIds: ["loser-1"] },
             error: null,
           }),
         );
@@ -1151,7 +1562,7 @@ describe("daemon server", () => {
       },
     });
     expect(defaultMerge.json().error).toBeNull();
-    expect(defaultMerge.json().result).toMatchObject({ opId: "op-merge", count: 1 });
+    expect(defaultMerge.json().result).toMatchObject({ count: 1, undo: { targetCount: 1 } });
 
     const missingHash = await bundle.app.inject({
       method: "POST",
@@ -1163,7 +1574,7 @@ describe("daemon server", () => {
         params: { keepId: "keeper-1", mergeIds: ["loser-1"], structural: true, confirm: true },
       },
     });
-    expect(missingHash.json().error.code).toBe("dry_run_required");
+    expect(missingHash.json().error.code).toBe("experimental_disabled");
 
     const dryRun = await bundle.app.inject({
       method: "POST",
@@ -1175,30 +1586,8 @@ describe("daemon server", () => {
         params: { keepId: "keeper-1", mergeIds: ["loser-1"], structural: true },
       },
     });
-    expect(dryRun.json().error).toBeNull();
-    expect(dryRun.json().result.fromDryRun).toMatch(/^[a-f0-9]{64}$/);
-
-    const executed = await bundle.app.inject({
-      method: "POST",
-      url: "/",
-      headers: authHeaders,
-      payload: {
-        action: "mergeRems",
-        version: 1,
-        params: {
-          keepId: "keeper-1",
-          mergeIds: ["loser-1"],
-          structural: true,
-          confirm: true,
-          fromDryRun: dryRun.json().result.fromDryRun,
-        },
-      },
-    });
-    expect(executed.json().error).toBeNull();
-    expect(executed.json().result).toMatchObject({ opId: "op-merge", count: 1 });
-    expect(seen.map((item) => item.action)).toEqual(["mergeRems", "mergeRems", "mergeRems", "mergeRems", "mergeRems", "mergeRems"]);
-    expect(seen.filter((item) => item.params.confirm === true && item.params.structural === true)).toHaveLength(1);
-    expect(seen.filter((item) => item.params.dryRun === true)).toHaveLength(4);
+    expect(dryRun.json().error.code).toBe("experimental_disabled");
+    expect(seen.map((item) => item.action)).toEqual(["mergeRems", "prepareMutation", "mergeRems"]);
     ws.close();
     await bundle.app.close();
   });

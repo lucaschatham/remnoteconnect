@@ -1,16 +1,15 @@
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   ApiEnvelopeSchema,
   BUILD_HASH,
   DAEMON_VERSION,
-  actionMetadata,
+  describeActionMetadata,
   getActionMetadata,
   fail,
-  IRREVERSIBLE_RECONFIRM_PHRASE,
   isPluginAction,
   nativeActions,
   adapterActions,
@@ -18,6 +17,7 @@ import {
   plannedActions,
   pluginActions,
   PROTOCOL_VERSION,
+  parseActionParams,
   retryableBridgeError,
   unsupportedAnkiActions,
   type ApiError,
@@ -29,10 +29,12 @@ import type { DaemonConfig } from "./config.js";
 import { PluginBridge } from "./bridge.js";
 import { bearerToken, isAllowedHost, isAllowedOrigin, safeTokenEqual } from "./security.js";
 import { appendAudit, tailAudit } from "./audit.js";
-import { clearUndoRecords, readUndoRecord, writeUndoRecord, type UndoRecord } from "./undoStore.js";
+import { clearUndoRecords, listUndoRecords, readUndoRecord, updateUndoRecordState, writeUndoRecord, type UndoRecord } from "./undoStore.js";
 import { dryRunHash } from "./dryRun.js";
 import { appendExternalId, readExternalIdMap } from "./externalIdIndex.js";
 import { DurableJobManager } from "./durableJobs.js";
+import { IRREVERSIBLE_SESSION_BUDGET, MAGNITUDE_THRESHOLD, SafetyCoordinator } from "./safety.js";
+import { PairingStore } from "./pairing.js";
 
 export type ServerBundle = {
   app: FastifyInstance;
@@ -40,16 +42,14 @@ export type ServerBundle = {
 };
 
 type DispatchState = {
-  dryRunHashes: Set<string>;
-  irreversibleRemaining: number;
   startedAt: number;
   readonlyMode: boolean;
+  safety: SafetyCoordinator;
+  pairing: PairingStore;
 };
 
 const MAX_MULTI_DEPTH = 1;
 const MAX_MULTI_ACTIONS = 50;
-const MAGNITUDE_THRESHOLD = 50;
-const IRREVERSIBLE_SESSION_BUDGET = 3;
 const DEFAULT_BODY_LIMIT_BYTES = 50 * 1024 * 1024;
 const ENABLE_ACTION_LOGS = process.env.REMNOTE_CONNECT_LOG === "1";
 
@@ -106,7 +106,7 @@ function countFromResult(result: unknown): number | undefined {
 
 function idsFromResult(result: unknown): string[] {
   const record = resultRecord(result);
-  const ids = [record.remIds, record.ids, record.cardIds]
+  const ids = [record.remIds, record.ids, record.cardIds, record.targetIds]
     .flatMap((value) => (Array.isArray(value) ? value : []))
     .filter((value): value is string => typeof value === "string");
   return [...new Set(ids)];
@@ -150,13 +150,17 @@ function requiresDryRunHash(action: string, params: Record<string, unknown>, met
   return Boolean(meta?.requiresDryRunHash || (action === "mergeRems" && params.structural === true));
 }
 
-function consumesIrreversibleBudget(action: string, params: Record<string, unknown>, meta: ReturnType<typeof getActionMetadata>): boolean {
-  return Boolean(meta?.requiresDryRunHash || meta?.irreversible || (action === "mergeRems" && params.structural === true));
+function isBlockedByReadonly(action: string, state: DispatchState): boolean {
+  return state.readonlyMode && getActionMetadata(action)?.mutates === true;
 }
 
-function isBlockedByReadonly(action: string, params: Record<string, unknown>, state: DispatchState): boolean {
-  if (params.dryRun === true) return false;
-  return state.readonlyMode && getActionMetadata(action)?.mutates === true;
+const INTERNAL_PARAM_NAMES = new Set(["irreversibleVerified", "undoPrepared", "expectedTargetIds", "expectedFingerprints", "undoRecord", "skipUndoRecord"]);
+const PUBLIC_OP_ID_ACTIONS = new Set(["undo", "undoClear", "restoreTombstone"]);
+
+function unsafePublicParam(action: string, params: Record<string, unknown>): string | undefined {
+  for (const name of INTERNAL_PARAM_NAMES) if (params[name] !== undefined) return name;
+  if (params.opId !== undefined && !PUBLIC_OP_ID_ACTIONS.has(action)) return "opId";
+  return undefined;
 }
 
 async function runBridgeJob(
@@ -181,14 +185,27 @@ async function runBridgeJob(
 
 async function dispatchAction(
   action: string,
-  params: Record<string, unknown>,
+  inputParams: Record<string, unknown>,
   bridge: PluginBridge,
   durableJobs: DurableJobManager,
   config: DaemonConfig,
   state: DispatchState,
   depth = 0,
   signal?: AbortSignal,
+  internal = false,
 ): Promise<ApiResponse> {
+  let params = inputParams;
+  const meta = getActionMetadata(action);
+  if (!internal) {
+    const unsafeParam = unsafePublicParam(action, params);
+    if (unsafeParam) return fail("unsafe_parameter", `${unsafeParam} is daemon-internal and cannot be supplied by callers.`, { action, parameter: unsafeParam });
+    if (meta) {
+      const parsedParams = parseActionParams(action, params);
+      if (!parsedParams.success) return fail("bad_request", `Invalid parameters for ${action}.`, parsedParams.error.flatten());
+      params = parsedParams.data;
+    }
+  }
+  if (meta && !meta.implemented) return fail("not_implemented", `${action} is not implemented in this build.`);
   if (action === "version") return ok(PROTOCOL_VERSION);
   if (action === "status") {
     return ok({
@@ -215,10 +232,9 @@ async function dispatchAction(
   if (action === "describe") {
     return ok({
       protocolVersion: PROTOCOL_VERSION,
-      actions: actionMetadata,
+      actions: describeActionMetadata(),
       magnitudeThreshold: MAGNITUDE_THRESHOLD,
       irreversibleSessionBudget: IRREVERSIBLE_SESSION_BUDGET,
-      irreversibleReconfirmPhrase: IRREVERSIBLE_RECONFIRM_PHRASE,
       contentFeatures: {
         durableAsync: true,
         parseAndInsertHtml: true,
@@ -239,8 +255,7 @@ async function dispatchAction(
       bridge: bridgeStatus,
       readonlyMode: state.readonlyMode,
       daemonBuildHash: BUILD_HASH,
-      irreversibleRemaining: state.irreversibleRemaining,
-      dryRunHashesRetained: state.dryRunHashes.size,
+      ...state.safety.metrics(),
     });
   }
   if (action === "readonly") {
@@ -252,6 +267,7 @@ async function dispatchAction(
     if (mode === "on") state.readonlyMode = true;
     if (mode === "off") state.readonlyMode = false;
     if (previous !== state.readonlyMode) {
+      await durableJobs.setReadonly(state.readonlyMode);
       await appendAudit(config.logDir, {
         ts: new Date().toISOString(),
         action: "readonly",
@@ -266,33 +282,32 @@ async function dispatchAction(
       daemonBuildHash: BUILD_HASH,
     });
   }
-  if (isBlockedByReadonly(action, params, state)) {
+  if (isBlockedByReadonly(action, state)) {
     return fail("readonly_mode", `${action} is blocked because RemNoteConnect read-only mode is enabled. Run readonly off to allow mutations.`, {
       action,
       readonlyMode: true,
     });
   }
+  if (action === "approveIrreversible") return state.safety.approve(params);
   if (action === "reconfirmIrreversibleBudget") {
-    const phrase = typeof params.phrase === "string" ? params.phrase.trim() : "";
-    if (params.confirm !== true || phrase !== IRREVERSIBLE_RECONFIRM_PHRASE) {
-      return fail("confirm_required", "reconfirmIrreversibleBudget requires confirm:true and the exact irreversible confirmation phrase.", {
-        phrase: IRREVERSIBLE_RECONFIRM_PHRASE,
+    const reset = state.safety.resetBudget(typeof params.approvalNonce === "string" ? params.approvalNonce : "");
+    if (!reset.error) {
+      await appendAudit(config.logDir, {
+        ts: new Date().toISOString(),
+        action,
+        targetIds: [],
+        count: IRREVERSIBLE_SESSION_BUDGET,
+        status: "success",
       });
     }
-    state.irreversibleRemaining = IRREVERSIBLE_SESSION_BUDGET;
-    await appendAudit(config.logDir, {
-      ts: new Date().toISOString(),
-      action: "reconfirmIrreversibleBudget",
-      targetIds: [],
-      count: IRREVERSIBLE_SESSION_BUDGET,
-      status: "success",
-    });
-    return ok({
-      irreversibleRemaining: state.irreversibleRemaining,
-      irreversibleSessionBudget: IRREVERSIBLE_SESSION_BUDGET,
-    });
+    return reset;
+  }
+  if (action === "pair") {
+    const pairing = state.pairing.create();
+    return ok({ ...pairing, instruction: "Paste this short-lived code into the RemNoteConnect daemon token setting." });
   }
   if (action === "rotateToken") {
+    if (params.dryRun === true) return ok({ dryRun: true, wouldRotate: true });
     if (!bridge.status().connected) return fail("plugin_disconnected", "RemNote plugin must be connected before rotating the daemon token.");
     try {
       const nextToken = randomBytes(32).toString("hex");
@@ -344,11 +359,16 @@ async function dispatchAction(
         checks.scopeProbe = scopeProbe;
         okStatus = resultRecord(scopeProbe).ok === true;
       } catch (error) {
+        const message = error instanceof Error ? error.message : String((error as Partial<ApiError>)?.message ?? error);
         checks.scopeProbe = {
           ok: false,
-          error: error instanceof Error ? error.message : String((error as Partial<ApiError>)?.message ?? error),
+          error: message,
           code: (error as Partial<ApiError>)?.code,
         };
+        if (message.includes("Managed root Rem")) {
+          checks.initialization = { ok: false, command: "node scripts/rnc.mjs init" };
+          warnings.push("The operational RemNoteConnect root is missing. Run: node scripts/rnc.mjs init");
+        }
         okStatus = false;
       }
     } else {
@@ -376,15 +396,55 @@ async function dispatchAction(
     return ok(await tailAudit(config.logDir, Number(params.n ?? 50)));
   }
   if (action === "undoClear") {
-    return ok({ count: await clearUndoRecords(config.appDir, typeof params.opId === "string" ? params.opId : undefined) });
+    const requestedOpId = typeof params.opId === "string" ? params.opId : undefined;
+    const records = (await listUndoRecords(config.appDir)).filter((record) => !requestedOpId || record.opId === requestedOpId);
+    const preview = { dryRun: true, count: records.length, opIds: records.map((record) => record.opId).sort() };
+    if (params.confirm !== true) {
+      const recorded = state.safety.recordDryRun(action, preview);
+      return ok({ ...preview, fromDryRun: recorded.hash, warning: "undoClear permanently removes local undo records." });
+    }
+    const verification = state.safety.consumeIrreversible(action, preview, params);
+    if (verification.error) return verification;
+    const count = await clearUndoRecords(config.appDir, requestedOpId);
+    await appendAudit(config.logDir, {
+      ts: new Date().toISOString(),
+      action,
+      targetIds: records.map((record) => record.opId),
+      count,
+      status: "success",
+    });
+    return ok({ count, opIds: records.map((record) => record.opId), irreversibleRemaining: verification.result.remaining });
   }
   if (action === "undo") {
     const opId = typeof params.opId === "string" ? params.opId : "";
     if (!opId) return fail("bad_request", "undo requires opId.");
     try {
       const undoRecord = await readUndoRecord(config.appDir, opId);
+      if (params.dryRun === true) {
+        return ok({ dryRun: true, opId, count: undoRecord.targets.length, remIds: undoRecord.targets.map((target) => target.id) });
+      }
+      const redoOpId = randomUUID();
+      const targetIds = undoRecord.targets.map((target) => String(target.id ?? "")).filter(Boolean);
+      const prepared = await runBridgeJob(
+        bridge,
+        "prepareMutation",
+        { action: "undo", opId: redoOpId, params: { remIds: targetIds } },
+        pluginActionTimeout("undo", params),
+        false,
+        signal,
+      );
+      const redoRecord = undoRecordFromResult(prepared);
+      if (!redoRecord) return fail("internal_error", "undo could not create a write-ahead redo record.");
+      await writeUndoRecord(config.appDir, { ...redoRecord, state: "prepared" });
       const started = Date.now();
-      const result = await runBridgeJob(bridge, "undo", { undoRecord }, pluginActionTimeout("undo", params), false, signal);
+      let result: unknown;
+      try {
+        result = await runBridgeJob(bridge, "undo", { undoRecord }, pluginActionTimeout("undo", params), false, signal);
+        await updateUndoRecordState(config.appDir, redoOpId, "committed");
+      } catch (error) {
+        await updateUndoRecordState(config.appDir, redoOpId, "outcome_unknown").catch(() => undefined);
+        throw error;
+      }
       await appendAudit(config.logDir, {
         ts: new Date().toISOString(),
         action: "undo",
@@ -394,8 +454,66 @@ async function dispatchAction(
         status: "success",
         durationMs: Date.now() - started,
       });
-      return ok(result);
+      return ok({ ...resultRecord(result), redoOpId });
     } catch (error) {
+      return responseFromError(error);
+    }
+  }
+  if (action === "restoreTombstone") {
+    const requestedOpId = typeof params.opId === "string" ? params.opId : undefined;
+    const requestedRemId = typeof params.remId === "string" ? params.remId : typeof params.id === "string" ? params.id : undefined;
+    let undoRecord: UndoRecord | undefined;
+    if (requestedOpId) undoRecord = await readUndoRecord(config.appDir, requestedOpId).catch(() => undefined);
+    if (!undoRecord && requestedRemId) {
+      for (const record of await listUndoRecords(config.appDir)) {
+        const candidate = await readUndoRecord(config.appDir, record.opId).catch(() => undefined);
+        if (candidate?.targets.some((target) => target.id === requestedRemId)) {
+          undoRecord = candidate;
+          break;
+        }
+      }
+    }
+    if (!undoRecord) return fail("not_found", "No daemon undo record matches the requested tombstone.");
+    if (params.confirm !== true || params.dryRun === true) {
+      return ok({
+        dryRun: true,
+        opId: undoRecord.opId,
+        count: undoRecord.targets.length,
+        remIds: undoRecord.targets.map((target) => target.id),
+        warning: "restoreTombstone defaults to dry-run. Pass confirm:true to restore the exact targets.",
+      });
+    }
+    if (undoRecord.targets.length > MAGNITUDE_THRESHOLD && Number(params.confirmCount) !== undoRecord.targets.length) {
+      return fail("magnitude_guard", `restoreTombstone resolves ${undoRecord.targets.length} targets. Pass confirmCount:${undoRecord.targets.length}.`);
+    }
+    let redoOpId: string | undefined;
+    try {
+      redoOpId = randomUUID();
+      const targetIds = undoRecord.targets.map((target) => String(target.id ?? "")).filter(Boolean);
+      const prepared = await runBridgeJob(
+        bridge,
+        "prepareMutation",
+        { action, opId: redoOpId, params: { remIds: targetIds } },
+        pluginActionTimeout(action, params),
+        false,
+        signal,
+      );
+      const redoRecord = undoRecordFromResult(prepared);
+      if (!redoRecord) return fail("internal_error", "restoreTombstone could not create a write-ahead undo record.");
+      await writeUndoRecord(config.appDir, { ...redoRecord, state: "prepared" });
+      const result = await runBridgeJob(bridge, "restoreTombstone", { undoRecord }, pluginActionTimeout(action, params), false, signal);
+      await updateUndoRecordState(config.appDir, redoOpId, "committed");
+      await appendAudit(config.logDir, {
+        ts: new Date().toISOString(),
+        action,
+        opId: undoRecord.opId,
+        targetIds: idsFromResult(result),
+        count: countFromResult(result),
+        status: "success",
+      });
+      return ok({ ...resultRecord(result), undo: { opId: redoOpId, targetCount: targetIds.length } });
+    } catch (error) {
+      if (redoOpId) await updateUndoRecordState(config.appDir, redoOpId, "outcome_unknown").catch(() => undefined);
       return responseFromError(error);
     }
   }
@@ -428,6 +546,7 @@ async function dispatchAction(
         state,
         depth + 1,
         signal,
+        true,
       );
     } catch (error) {
       return responseFromError(error);
@@ -455,14 +574,13 @@ async function dispatchAction(
     }
     return ok(results);
   }
-  const meta = getActionMetadata(action);
-  if (meta && !meta.implemented) {
-    return fail("not_implemented", `${action} is planned but is not implemented in this build.`);
-  }
   if (!isPluginAction(action)) {
     return fail("unsupported", `Unknown action: ${action}`);
   }
 
+  let preparedOpId: string | undefined;
+  let operationOpId: string | undefined;
+  let undoStored: Awaited<ReturnType<typeof writeUndoRecord>> | undefined;
   try {
     const started = Date.now();
     const actionParams = { ...params };
@@ -476,41 +594,74 @@ async function dispatchAction(
     if (shouldDefaultDryRun(action, actionParams)) actionParams.dryRun = true;
 
     const actionMeta = getActionMetadata(action);
+    if (!actionMeta) return fail("unsupported", `Unknown action: ${action}`);
+    if (action === "answerCard" || action === "deleteFlashcards") {
+      return fail("experimental_disabled", `${action} is disabled until scheduler state can be captured, restored, and live-tested.`);
+    }
+    if (action === "mergeRems" && actionParams.structural === true) {
+      return fail("experimental_disabled", "Structural merge is disabled until complete reference inversion and live undo verification are available.");
+    }
     const actionRequiresDryRunHash = requiresDryRunHash(action, actionParams, actionMeta);
-    const actionConsumesIrreversibleBudget = consumesIrreversibleBudget(action, actionParams, actionMeta);
     const needsSafetyPreflight = actionParams.confirm === true && actionMeta && (actionMeta.magnitudeGuarded || actionRequiresDryRunHash);
     let preflight: unknown;
-    let hash: string | undefined;
+    let planHash: string | undefined;
     if (needsSafetyPreflight) {
       preflight = await runBridgeJob(bridge, action, { ...actionParams, dryRun: true, confirm: false }, pluginActionTimeout(action, actionParams), true, signal);
-      const count = countFromResult(preflight);
-      if (typeof count === "number" && count > MAGNITUDE_THRESHOLD && Number(actionParams.confirmCount) !== count) {
-        return fail("magnitude_guard", `${action} resolved ${count} targets. Pass confirmCount:${count} to execute.`, {
-          count,
-          threshold: MAGNITUDE_THRESHOLD,
-          targetIds: idsFromResult(preflight),
-        });
-      }
+      const magnitudeError = state.safety.magnitudeError(action, preflight, actionParams.confirmCount);
+      if (magnitudeError) return magnitudeError;
       if (actionRequiresDryRunHash) {
-        hash = dryRunHash(action, preflight);
-        if (typeof actionParams.fromDryRun !== "string") {
-          return fail("dry_run_required", `${action} requires fromDryRun from a prior dry-run.`, { fromDryRun: hash });
-        }
-        if (actionParams.fromDryRun !== hash || !state.dryRunHashes.has(hash)) {
-          return fail("dry_run_mismatch", `${action} fromDryRun does not match the current target set.`, { expected: hash });
-        }
-        if (state.irreversibleRemaining <= 0) {
-          return fail("irreversible_budget_exceeded", "Irreversible operation session budget is exhausted. Run reconfirmIrreversibleBudget with explicit human confirmation before continuing.");
-        }
+        const verification = state.safety.consumeIrreversible(action, preflight, actionParams);
+        if (verification.error) return verification;
+        planHash = verification.result.hash;
         actionParams.irreversibleVerified = true;
+        actionParams.expectedTargetIds = verification.result.targetIds;
+        actionParams.expectedFingerprints = resultRecord(preflight).fingerprints;
       }
     }
 
+    if (actionMeta.undoStrategy === "writeAhead" && actionParams.dryRun !== true) {
+      preparedOpId = randomUUID();
+      const prepared = await runBridgeJob(
+        bridge,
+        "prepareMutation",
+        { action, opId: preparedOpId, params: actionParams },
+        pluginActionTimeout(action, actionParams),
+        false,
+        signal,
+      );
+      const undoRecord = undoRecordFromResult(prepared);
+      if (!undoRecord) throw { code: "internal_error", message: `${action} did not produce a write-ahead undo record.` } satisfies ApiError;
+      const preparedTargetIds = idsFromResult({ targetIds: resultRecord(prepared).targetIds });
+      planHash = planHash ?? dryRunHash(action, { targetIds: preparedTargetIds, count: preparedTargetIds.length });
+      undoStored = await writeUndoRecord(config.appDir, { ...undoRecord, state: "prepared", planHash });
+      actionParams.opId = preparedOpId;
+      actionParams.expectedTargetIds = preparedTargetIds;
+      actionParams.expectedFingerprints = resultRecord(prepared).fingerprints;
+      actionParams.undoPrepared = true;
+    }
+
+    if (actionMeta.mutates && actionParams.dryRun !== true) {
+      operationOpId = preparedOpId ?? randomUUID();
+      actionParams.opId = operationOpId;
+      planHash = planHash ?? dryRunHash(action, {
+        externalId,
+        declaredCount:
+          Array.isArray(actionParams.cards) ? actionParams.cards.length : Array.isArray(actionParams.notes) ? actionParams.notes.length : undefined,
+      });
+      await appendAudit(config.logDir, {
+        ts: new Date().toISOString(),
+        action,
+        opId: operationOpId,
+        targetIds: Array.isArray(actionParams.expectedTargetIds) ? (actionParams.expectedTargetIds as string[]) : [],
+        count: Array.isArray(actionParams.expectedTargetIds) ? actionParams.expectedTargetIds.length : undefined,
+        status: "prepared",
+      });
+    }
+
     const result = await runBridgeJob(bridge, action, actionParams, pluginActionTimeout(action, actionParams), actionMeta?.retryable === true, signal);
-    const resultHash = actionRequiresDryRunHash && resultRecord(result).dryRun === true ? dryRunHash(action, result) : undefined;
-    if (resultHash) {
-      state.dryRunHashes.add(resultHash);
-      const withHash = result && typeof result === "object" && !Array.isArray(result) ? { ...(result as Record<string, unknown>), fromDryRun: resultHash } : result;
+    if (resultRecord(result).dryRun === true) {
+      const recorded = state.safety.recordDryRun(action, result);
+      const withHash = result && typeof result === "object" && !Array.isArray(result) ? { ...(result as Record<string, unknown>), fromDryRun: recorded.hash } : result;
       await appendAudit(config.logDir, {
         ts: new Date().toISOString(),
         action,
@@ -523,40 +674,56 @@ async function dispatchAction(
       return ok(withHash);
     }
 
-    const undoRecord = undoRecordFromResult(result);
-    let undoStored: Awaited<ReturnType<typeof writeUndoRecord>> | undefined;
-    if (undoRecord) undoStored = await writeUndoRecord(config.appDir, undoRecord);
+    if (preparedOpId) await updateUndoRecordState(config.appDir, preparedOpId, "committed");
+    const outcomeUndoRecord = !undoStored ? undoRecordFromResult(result) : undefined;
+    if (outcomeUndoRecord) undoStored = await writeUndoRecord(config.appDir, { ...outcomeUndoRecord, state: "committed" });
 
     if (externalId) {
       const id = typeof resultRecord(result).id === "string" ? (resultRecord(result).id as string) : undefined;
       if (id) await appendExternalId(config.appDir, { action, externalId, remId: id });
     }
 
-    if (actionConsumesIrreversibleBudget && actionParams.confirm === true) state.irreversibleRemaining -= 1;
-
     const cleanResult = cleanPluginResult(result);
+    const enrichedResult = cleanResult && typeof cleanResult === "object" && !Array.isArray(cleanResult)
+      ? {
+          ...(cleanResult as Record<string, unknown>),
+          opId: operationOpId ?? opIdFromResult(cleanResult),
+          planHash,
+          affectedCount: countFromResult(cleanResult),
+        }
+      : cleanResult;
     await appendAudit(config.logDir, {
       ts: new Date().toISOString(),
       action,
-      opId: opIdFromResult(cleanResult, undoRecord?.opId),
-      targetIds: idsFromResult(cleanResult),
-      count: countFromResult(cleanResult),
-      status: resultRecord(cleanResult).dryRun === true ? "dry_run" : "success",
+      opId: opIdFromResult(enrichedResult, outcomeUndoRecord?.opId),
+      targetIds: idsFromResult(enrichedResult),
+      count: countFromResult(enrichedResult),
+      status: "success",
       durationMs: Date.now() - started,
     });
 
-    if (undoStored && cleanResult && typeof cleanResult === "object" && !Array.isArray(cleanResult)) {
-      return ok({ ...(cleanResult as Record<string, unknown>), undo: { opId: undoStored.opId, targetCount: undoStored.targetCount } });
+    if (undoStored && enrichedResult && typeof enrichedResult === "object" && !Array.isArray(enrichedResult)) {
+      return ok({ ...(enrichedResult as Record<string, unknown>), undo: { opId: undoStored.opId, targetCount: undoStored.targetCount } });
     }
-    return ok(cleanResult);
+    return ok(enrichedResult);
   } catch (error) {
+    if (preparedOpId) await updateUndoRecordState(config.appDir, preparedOpId, "outcome_unknown").catch(() => undefined);
+    const errorDetails = resultRecord((error as Partial<ApiError>)?.details);
+    const outcomeUnknown = meta?.mutates === true && errorDetails.outcomeUnknown === true;
     await appendAudit(config.logDir, {
       ts: new Date().toISOString(),
       action,
+      opId: operationOpId ?? preparedOpId,
       targetIds: [],
-      status: "error",
-      errorCode: (error as Partial<ApiError>)?.code,
+      status: outcomeUnknown ? "outcome_unknown" : "error",
+      errorCode: outcomeUnknown ? "outcome_unknown" : (error as Partial<ApiError>)?.code,
     }).catch(() => undefined);
+    if (outcomeUnknown) {
+      return fail("outcome_unknown", `${action} lost contact after dispatch; inspect RemNote before retrying.`, {
+        opId: operationOpId ?? preparedOpId,
+        originalError: (error as Partial<ApiError>)?.code,
+      });
+    }
     return responseFromError(error);
   }
 }
@@ -603,15 +770,17 @@ async function readMediaFile(config: DaemonConfig, name: string): Promise<{ body
 export function buildServer(config: DaemonConfig): ServerBundle {
   const bodyLimit = Number(process.env.REMNOTE_CONNECT_BODY_LIMIT_BYTES ?? DEFAULT_BODY_LIMIT_BYTES);
   const app = Fastify({ logger: false, bodyLimit });
-  const bridge = new PluginBridge(config);
-  const durableJobs = new DurableJobManager(config, bridge);
-  const wss = bridge.createWebSocketServer();
+  const pairing = new PairingStore();
+  const bridge = new PluginBridge(config, pairing);
   const state: DispatchState = {
-    dryRunHashes: new Set<string>(),
-    irreversibleRemaining: IRREVERSIBLE_SESSION_BUDGET,
     startedAt: Date.now(),
     readonlyMode: config.readonlyMode,
+    safety: new SafetyCoordinator(),
+    pairing,
   };
+  const durableJobs = new DurableJobManager(config, bridge, () => state.readonlyMode);
+  void durableJobs.start();
+  const wss = bridge.createWebSocketServer();
 
   app.server.on("upgrade", (request, socket, head) => {
     if (request.url !== "/bridge" || !isAllowedHost(request.headers.host, config)) {

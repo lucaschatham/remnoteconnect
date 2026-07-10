@@ -28,10 +28,24 @@ Symptoms:
 Fix:
 
 ```sh
-npx pnpm@11.7.0 token:unsafe
+node scripts/rnc.mjs pair
 ```
 
-Paste the current token into the local plugin settings. Do not paste tokens into public issues.
+Paste the short-lived pairing code into the local plugin setting. Direct token printing is an unsafe recovery-only path. Do not paste tokens into public issues.
+
+## Operational Root Missing
+
+If `doctor` reports that `RemNoteConnect` or its Trash hierarchy is missing, temporarily disable read-only mode and initialize it explicitly:
+
+```sh
+node scripts/rnc.mjs readonly off
+node scripts/rnc.mjs init
+node scripts/rnc.mjs readonly on
+```
+
+## Durable Job Is Outcome Unknown
+
+This means the daemon lost contact after dispatch and cannot prove whether RemNote applied the write. Do not resubmit blindly. Reconcile using the item's `externalId` or inspect the intended parent in RemNote, then create a new job only for items proven absent.
 
 ## Port Conflicts
 

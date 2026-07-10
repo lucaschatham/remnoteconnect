@@ -18,6 +18,8 @@ const shared = read("shared/src/index.ts");
 const executor = read("plugin/src/executor.ts");
 const server = read("daemon/src/server.ts");
 const bridgeClient = read("plugin/src/bridgeClient.ts");
+const durableJobs = read("daemon/src/durableJobs.ts");
+const cli = read("scripts/rnc.mjs");
 const manifest = JSON.parse(read("plugin/public/manifest.json"));
 
 check("readonly-error-code", shared.includes('| "readonly_mode"'), "shared ErrorCode must include readonly_mode.");
@@ -25,6 +27,29 @@ check("readonly-metadata", shared.includes("readonly: action({") && shared.inclu
 check("daemon-readonly-guard", server.includes("isBlockedByReadonly") && server.includes("readonlyMode"), "daemon must own the read-only guard.");
 check("plugin-build-handshake", bridgeClient.includes("pluginBuildHash") && bridgeClient.includes("BUILD_HASH"), "plugin must report its build hash in hello.");
 check("plugin-health-panel", bridgeClient.includes("renderHealth()") && bridgeClient.includes("All scope"), "plugin must render visible connection health.");
+const forbiddenBuildTokenName = ["VITE", "REMNOTE", "CONNECT", "TOKEN"].join("_");
+check("no-build-token", !bridgeClient.includes(forbiddenBuildTokenName), "the daemon token must never be embedded by Vite.");
+check(
+  "unsafe-control-rejection",
+  server.includes("INTERNAL_PARAM_NAMES") && server.includes("unsafePublicParam") && server.includes('fail("unsafe_parameter"'),
+  "daemon must reject caller-supplied internal safety controls.",
+);
+check(
+  "write-ahead-undo",
+  server.indexOf('"prepareMutation"') >= 0 && server.indexOf("writeUndoRecord") < server.lastIndexOf("runBridgeJob(bridge, action"),
+  "reversible mutation paths must persist prepared undo before final plugin dispatch.",
+);
+check(
+  "job-read-purity",
+  !/async status[\s\S]{0,500}this\.kick/.test(durableJobs) && !/async wait[\s\S]{0,700}this\.kick/.test(durableJobs),
+  "jobStatus and jobWait must not start queued work.",
+);
+check(
+  "scheduler-disabled",
+  executor.includes('case "answerCard"') && executor.includes('case "deleteFlashcards"') && !executor.includes("await card.remove()"),
+  "scheduler mutation and generated-card removal must remain disabled until reversible and live-verified.",
+);
+check("cli-universal-action", cli.includes('command === "call"') && cli.includes("paramsPayload"), "CLI must expose every registry action through rnc call.");
 
 const scopes = Array.isArray(manifest.requiredScopes) ? manifest.requiredScopes : [];
 check(
@@ -43,11 +68,7 @@ check(
   functionIndex >= 0 && removeIndex > functionIndex && emptyTrashIndex > functionIndex,
   "rem.remove must stay isolated in removeRemTree and reachable only from emptyTrash.",
 );
-check(
-  "card-delete-irreversible-gate",
-  executor.includes("deleteFlashcards") && executor.includes("params.irreversibleVerified !== true") && executor.includes("await card.remove()"),
-  "card.remove must remain behind daemon irreversible verification.",
-);
+check("no-card-hard-delete", !executor.includes("await card.remove()"), "card.remove must not ship while scheduler restoration is unproven.");
 check("no-graph-externalid-tags", !executor.includes("rnc:externalId"), "externalId idempotency must not write rnc:externalId tags into the graph.");
 
 if (existsSync(join(rootDir, "scripts/check-no-token.mjs"))) {

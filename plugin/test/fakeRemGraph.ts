@@ -36,8 +36,8 @@ export class FakeCard {
 export class FakeRem {
   readonly _id: string;
   parent: string | null = null;
-  text = "";
-  backText = "";
+  text: unknown = "";
+  backText: unknown = "";
   createdAt = Date.now();
   updatedAt = Date.now();
   cards: FakeCard[] = [];
@@ -82,12 +82,12 @@ export class FakeRem {
   }
 
   async setText(value: unknown): Promise<void> {
-    this.text = this.graph.richTextToString(value);
+    this.text = value;
     this.updatedAt = Date.now();
   }
 
   async setBackText(value: unknown): Promise<void> {
-    this.backText = this.graph.richTextToString(value);
+    this.backText = value;
     this.updatedAt = Date.now();
   }
 
@@ -181,7 +181,11 @@ export class FakeRem {
 
   async remsReferencingThis(): Promise<FakeRem[]> {
     return [...this.graph.rems.values()].filter(
-      (rem) => !rem.removed && rem._id !== this._id && (rem.text.includes(this.graph.reference(this._id)) || rem.backText.includes(this.graph.reference(this._id))),
+      (rem) =>
+        !rem.removed &&
+        rem._id !== this._id &&
+        (this.graph.richTextToString(rem.text).includes(this.graph.reference(this._id)) ||
+          this.graph.richTextToString(rem.backText).includes(this.graph.reference(this._id))),
     );
   }
 

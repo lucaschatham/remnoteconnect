@@ -11,8 +11,8 @@ try {
     back: `Soft delete back ${runId}`,
   });
 
-  const deleted = await call("deleteRem", { id: created.id, confirm: true, opId: `${runId}-delete` });
-  assert(deleted.undo?.opId === `${runId}-delete`, "Soft delete did not store undo metadata.");
+  const deleted = await call("deleteRem", { id: created.id, confirm: true });
+  assert(typeof deleted.undo?.opId === "string" && deleted.undo.opId.length > 0, "Soft delete did not return a daemon-owned undo operation ID.");
 
   const afterDelete = await call("searchGraph", { query: `id:${created.id}` });
   assert(afterDelete.count === 1, "Soft-deleted Rem ID was not still resolvable.");

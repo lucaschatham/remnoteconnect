@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendJobSnapshot, compactDurableJobs, createDurableJob, jobStorePath, readDurableJob } from "../src/jobStore.js";
@@ -44,6 +44,18 @@ describe("job store", () => {
         status: "complete",
         params: { batchId: "anki:Deck", deckPath: "Anki Import::Deck" },
       });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores a torn final JSONL record but rejects corruption before the final line", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "remnote-connect-jobs-torn-"));
+    try {
+      const job = createDurableJob("createFlashcardsAsync", { cards: [{ front: "A" }] }, 1);
+      await appendJobSnapshot(dir, job);
+      appendFileSync(jobStorePath(dir), '{"schemaVersion":1,"jobId":"torn"', "utf8");
+      expect(await readDurableJob(dir, job.jobId)).toMatchObject({ status: "queued", cursor: 0 });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
