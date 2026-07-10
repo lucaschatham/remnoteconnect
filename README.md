@@ -81,6 +81,8 @@ RemNoteConnect can request whole-knowledge-base access, so the safety model is e
 - Mutating actions are blocked while `readonly` mode is on.
 - Destructive and bulk operations are dry-run-first.
 - Large operations require exact `confirmCount` approval.
+- Reversible edits persist mode-`0600` undo state before the plugin starts writing.
+- Irreversible operations require an unchanged plan plus a five-minute, single-use approval nonce.
 - Soft delete moves Rem into `RemNoteConnect/Trash/<opId>` instead of hard-deleting.
 - `emptyTrash` is the only hard-delete path.
 - Snapshot restore is treated as disaster recovery, not true undo, because restored Rem get new IDs.
@@ -127,17 +129,21 @@ In RemNote desktop:
 4. Enter `http://127.0.0.1:8080`.
 5. Approve the requested permissions.
 
-Print the local daemon token and paste it into the plugin settings:
+Generate a short-lived pairing code:
 
 ```sh
-npx pnpm@11.7.0 token:unsafe
+node scripts/rnc.mjs pair
 ```
+
+Paste that pairing code into the plugin's daemon token setting. The plugin exchanges it locally and stores the real token in plugin-local storage; the token is never embedded in the public bundle. Direct token entry remains a recovery path.
 
 Then verify:
 
 ```sh
 node scripts/rnc.mjs doctor
 node scripts/rnc.mjs status
+node scripts/rnc.mjs init
+node scripts/rnc.mjs readonly on
 ```
 
 For daily use, install the LaunchAgent:
@@ -188,13 +194,15 @@ Common native actions:
 - `findDuplicates`, `findEmpty`, `findOrphans`, `normalizeText`
 - `backupGraph`, `journalTail`, `undo`, `listTombstones`, `emptyTrash`
 
-Run:
+Run either:
 
 ```sh
 node scripts/rnc.mjs describe
+node scripts/rnc.mjs help emptyTrash
+node scripts/rnc.mjs call getRem --params '{"id":"REM_ID"}'
 ```
 
-to inspect the available action metadata from your local build.
+to inspect machine-readable action schemas or invoke any implemented action through the universal CLI route.
 
 ## Learning Workflows
 
@@ -208,17 +216,22 @@ See [docs/LEARNING_WORKFLOWS.md](docs/LEARNING_WORKFLOWS.md) for practical patte
 
 ## Maturity
 
-Stable in v0.3:
+Stable in v0.4:
 
 - local daemon and RemNote plugin bridge
 - CLI and HTTP action envelope
-- read-only mode, dry-runs, and exact-count approval guards
+- daemon-enforced read-only mode and mutation-free previews
+- write-ahead undo for reversible edits
+- exact recursive hard-delete plans and single-use approval nonces
+- durable-job outcome-unknown handling across disconnects and restarts
+- local token pairing and token-free plugin builds
 - basic document, flashcard, search, map, and cleanup workflows
 
-Experimental in v0.3:
+Disabled or experimental in v0.4:
 
 - image occlusion and advanced media workflows
-- scheduler mutation
+- scheduler mutation and generated-card deletion are disabled until complete scheduling state can be restored
+- structural merge is disabled until reference inversion is live-verified
 - semantic search sidecars
 - RemNote marketplace packaging
 - cross-platform packaging beyond local Mac usage
@@ -245,6 +258,7 @@ node scripts/live-scope.mjs
 node scripts/live-softdelete.mjs
 node scripts/live-docs.mjs
 node scripts/live-cleanup.mjs
+node scripts/live-v04-safety.mjs
 node scripts/live-idempotent.mjs
 ```
 

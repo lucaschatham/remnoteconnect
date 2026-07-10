@@ -23,8 +23,8 @@ try {
   }
   assert(cardId, "Created flashcard did not expose a card ID.");
 
-  const answered = await call("answerCard", { cardId, score: 2 });
-  assert(answered.id === cardId, "answerCard returned the wrong card ID.");
+  const answered = await call("answerCard", { cardId, score: 2 }).catch((error) => error.details);
+  assert(answered?.code === "experimental_disabled", "answerCard was not rejected as experimental.");
 
   const found = await call("searchFlashcards", { query: `id:${created.id}` });
   assert(found.count === 1, "Card was not searchable after answerCard.");
@@ -33,7 +33,7 @@ try {
   const residue = await call("searchGraph", { query: `text:"${runId}"` });
   assert(residue.count === 0, "Scheduler test residue remains.");
 
-  console.log(JSON.stringify({ status: "PASS", runId, remId: created.id, cardId }, null, 2));
+  console.log(JSON.stringify({ status: "PASS", runId, remId: created.id, cardId, scheduler: "experimental_disabled" }, null, 2));
 } catch (error) {
   await cleanupByText(runId);
   console.error(JSON.stringify({ status: "FAIL", runId, message: error instanceof Error ? error.message : String(error) }, null, 2));

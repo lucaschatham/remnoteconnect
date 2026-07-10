@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 export type UndoRecord = {
@@ -7,6 +7,9 @@ export type UndoRecord = {
   action: string;
   createdAt: string;
   targets: Array<Record<string, unknown>>;
+  state?: "prepared" | "committed" | "outcome_unknown";
+  planHash?: string;
+  committedAt?: string;
 };
 
 export function undoDir(appDir: string): string {
@@ -26,8 +29,40 @@ export async function writeUndoRecord(appDir: string, record: UndoRecord): Promi
   }
   await mkdir(undoDir(appDir), { recursive: true });
   const path = undoPath(appDir, record.opId);
-  await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+  const handle = await open(path, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify({ ...record, state: record.state ?? "prepared" }, null, 2)}\n`);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await chmod(path, 0o600);
   return { path, opId: record.opId, targetCount: record.targets.length };
+}
+
+export async function updateUndoRecordState(
+  appDir: string,
+  opId: string,
+  state: NonNullable<UndoRecord["state"]>,
+): Promise<UndoRecord> {
+  const path = undoPath(appDir, opId);
+  const current = await readUndoRecord(appDir, opId);
+  const next: UndoRecord = {
+    ...current,
+    state,
+    committedAt: state === "committed" ? new Date().toISOString() : current.committedAt,
+  };
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  const handle = await open(tmp, "r+");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await rename(tmp, path);
+  await chmod(path, 0o600);
+  return next;
 }
 
 export async function readUndoRecord(appDir: string, opId: string): Promise<UndoRecord> {

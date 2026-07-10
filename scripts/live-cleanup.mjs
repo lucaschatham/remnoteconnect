@@ -33,7 +33,7 @@ try {
   const structuralWithoutHash = await call("mergeRems", { keepId, mergeIds: [mergeId], structural: true, confirm: true }).catch(
     (error) => error.details,
   );
-  assert(structuralWithoutHash?.code === "dry_run_required", "Structural merge executed without a prior dry-run hash.");
+  assert(structuralWithoutHash?.code === "experimental_disabled", "Structural merge was not rejected as experimental.");
 
   await cleanupByText(runId);
   const residue = await call("searchGraph", { query: `text:"${runId}"` });

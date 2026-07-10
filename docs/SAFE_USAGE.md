@@ -28,13 +28,24 @@ RemNoteConnect can operate on an entire RemNote knowledge base after the desktop
 
 5. Only execute broad operations with an explicit confirmation and exact count.
 
-6. Turn read-only back on when the write window is done.
+6. For irreversible work, issue a nonce from an interactive terminal:
+
+   ```sh
+   node scripts/rnc.mjs approve-irreversible --action emptyTrash --from-dry-run HASH --confirm-count COUNT
+   ```
+
+   Pass the returned nonce once as `--approval-nonce`. It expires after five minutes.
+
+7. Turn read-only back on when the write window is done.
 
 ## Write Safety
 
 - Prefer soft delete. `deleteRem` moves Rem into `RemNoteConnect/Trash/<opId>` and preserves IDs.
 - Use `undo` for reversible mistakes.
 - Treat `emptyTrash` as irreversible.
+- `emptyTrash` counts every descendant, not only the visible tombstone folder.
+- An `outcome_unknown` durable job requires reconciliation; do not resubmit it blindly.
+- Scheduler mutation and structural merge are disabled in v0.4.
 - Treat snapshot restore as disaster recovery, not true undo. Restored Rem are copies with new IDs.
 - Do not run broad writes on a real graph until the dry-run output makes sense.
 

@@ -52,6 +52,14 @@ node scripts/live-softdelete.mjs
 node scripts/live-docs.mjs
 node scripts/live-cleanup.mjs
 node scripts/live-idempotent.mjs
+node scripts/live-v04-safety.mjs
+node scripts/live-restore.mjs
+node scripts/scheduler-smoke.mjs
+node scripts/chaos-async-job.mjs
+node scripts/chaos-daemon.mjs
+node scripts/job-retention.mjs 520
+node scripts/e2e.mjs
+node scripts/bench.mjs 500
 ```
 
 ## Tag And Release
@@ -59,8 +67,9 @@ node scripts/live-idempotent.mjs
 Only tag after GitHub Actions is green on `main`.
 
 ```sh
-git tag v0.3.0
-git push origin v0.3.0
+VERSION=$(node -p "require('./package.json').version")
+git tag "v$VERSION"
+git push origin "v$VERSION"
 ```
 
 Draft the GitHub release with:

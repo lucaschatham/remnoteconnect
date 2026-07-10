@@ -92,16 +92,16 @@ async function waitForBridge(timeoutMs) {
   throw new Error(`Bridge did not reconnect before timeout. Last status: ${JSON.stringify(last?.bridge ?? null)}`);
 }
 
-async function waitForCursor(jobId, minCursor, timeoutMs) {
+async function waitForActiveItem(jobId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let last;
   while (Date.now() < deadline) {
     last = await call("jobStatus", { jobId });
-    if (last.cursor >= minCursor && last.status !== "complete") return last;
+    if (last.status === "running" && Number.isInteger(last.activeItemIndex)) return last;
     if (last.status === "complete") throw new Error(`Durable job completed before daemon kill; throttle did not hold. ${JSON.stringify(last)}`);
-    await sleep(100);
+    await sleep(10);
   }
-  throw new Error(`Durable job did not reach cursor ${minCursor}. Last status: ${JSON.stringify(last)}`);
+  throw new Error(`Durable job did not expose an active dispatch checkpoint. Last status: ${JSON.stringify(last)}`);
 }
 
 async function ensureDaemonRunning() {
@@ -112,7 +112,9 @@ async function ensureDaemonRunning() {
 }
 
 try {
-  await waitForBridge(5_000);
+  const initialStatus = await waitForBridge(5_000);
+  const priorReadonly = initialStatus.readonlyMode === true;
+  await call("readonly", { mode: "off" });
   const cards = Array.from({ length: 8 }, (_, index) => ({
     front: `${runId} front ${index}`,
     back: `${runId} back ${index}`,
@@ -124,31 +126,51 @@ try {
     confirm: true,
     deckPath: runId,
     batchId: runId,
-    throttleMs: 350,
+    throttleMs: 100,
     cards,
   });
   const jobId = queued.jobId;
   assert(jobId, "createFlashcardsAsync did not return a jobId.");
 
-  const beforeKill = await waitForCursor(jobId, 2, 10_000);
+  const beforeKill = await waitForActiveItem(jobId, 10_000);
   const restart = await restartDaemon();
   await waitForHealth(true, 15_000);
   await waitForBridge(45_000);
 
-  const completed = await call("jobWait", { jobId, timeoutMs: 60_000 });
-  assert(completed.status === "complete", `jobWait did not complete resumed job: ${JSON.stringify(completed)}`);
-  assert(completed.ids?.length === cards.length, "Resumed durable job did not report every created Rem id.");
-  const materialized = await call("confirmMaterialized", { batchId: runId });
-  assert(materialized.count === cards.length, "confirmMaterialized did not return every created Rem id.");
+  let finalJob = await call("jobStatus", { jobId });
+  if (finalJob.status === "queued" || finalJob.status === "paused_readonly") {
+    await call("readonly", { mode: "off" });
+    finalJob = await call("jobWait", { jobId, timeoutMs: 60_000 });
+  }
+  assert(
+    finalJob.status === "complete" || finalJob.status === "outcome_unknown",
+    `Interrupted durable job neither completed safely nor stopped as outcome_unknown: ${JSON.stringify(finalJob)}`,
+  );
 
+  const found = await call("searchFlashcards", { query: `text:"${runId}"`, verbose: true });
+  const items = Array.isArray(found) ? found : found.items ?? [];
+  const counts = new Map();
+  for (const item of items) counts.set(item.text, (counts.get(item.text) ?? 0) + 1);
+  for (const card of cards) assert((counts.get(card.front) ?? 0) <= 1, `Daemon restart duplicated ${card.front}.`);
+  if (finalJob.status === "complete") {
+    for (const card of cards) assert(counts.get(card.front) === 1, `Safely resumed job did not materialize ${card.front}.`);
+  }
+
+  const materialized = await call("confirmMaterialized", { batchId: runId });
+  assert(materialized.count <= cards.length, "confirmMaterialized reported more IDs than submitted items.");
+
+  await call("readonly", { mode: "off" });
   await cleanupByText(runId);
   const residue = await call("searchGraph", { query: `text:"${runId}"` });
   assert(residue.count === 0, "Async chaos residue remains.");
+  if (priorReadonly) await call("readonly", { mode: "on" });
 
-  console.log(JSON.stringify({ status: "PASS", runId, jobId, beforeKill, ...restart, count: materialized.count }, null, 2));
+  console.log(JSON.stringify({ status: "PASS", runId, jobId, beforeKill, finalStatus: finalJob.status, ...restart, count: materialized.count }, null, 2));
 } catch (error) {
   await ensureDaemonRunning().catch(() => undefined);
+  await call("readonly", { mode: "off" }).catch(() => undefined);
   await cleanupByText(runId).catch(() => undefined);
+  await call("readonly", { mode: "on" }).catch(() => undefined);
   console.error(JSON.stringify({ status: "FAIL", runId, message: error instanceof Error ? error.message : String(error) }, null, 2));
   process.exitCode = 1;
 }

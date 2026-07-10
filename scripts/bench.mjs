@@ -4,6 +4,7 @@ import { call, cleanupByText } from "./live-helpers.mjs";
 const runId = `__rnc_bench__-${Date.now().toString(36)}`;
 const requestedCount = Number(process.env.REMNOTE_CONNECT_BENCH_COUNT ?? process.argv[2] ?? 200);
 const count = Number.isInteger(requestedCount) && requestedCount > 0 ? requestedCount : 200;
+let priorReadonly = true;
 
 function msSince(start) {
   return Number(process.hrtime.bigint() - start) / 1_000_000;
@@ -12,6 +13,8 @@ function msSince(start) {
 try {
   const status = await call("status");
   if (!status.bridge?.connected) throw new Error("Bridge is not connected; start RemNote and load the localhost plugin first.");
+  priorReadonly = status.readonlyMode === true;
+  await call("readonly", { mode: "off" });
 
   const cards = Array.from({ length: count }, (_, index) => ({
     front: `Bench front ${runId} ${index}`,
@@ -21,7 +24,7 @@ try {
   }));
 
   let started = process.hrtime.bigint();
-  const created = await call("createFlashcards", { cards, deckPath: runId, throttleMs: 0, batchId: runId, confirm: true });
+  const created = await call("createFlashcards", { cards, deckPath: runId, throttleMs: 0, batchId: runId, confirm: true, confirmCount: count });
   const createMs = msSince(started);
 
   started = process.hrtime.bigint();
@@ -48,4 +51,5 @@ try {
   process.exitCode = 1;
 } finally {
   await cleanupByText(runId);
+  if (priorReadonly) await call("readonly", { mode: "on" });
 }

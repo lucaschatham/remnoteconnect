@@ -185,6 +185,17 @@ export async function getManagedRoot(plugin: ReactRNPlugin, rootName = MANAGED_R
   return root;
 }
 
+export async function ensureManagedRoot(plugin: ReactRNPlugin, rootName = MANAGED_ROOT_NAME): Promise<RemObject> {
+  const existing = await plugin.rem.findByName(await toRichText(plugin, rootName), null);
+  if (existing) return existing;
+  const root = await plugin.rem.createRem();
+  if (!root) throw new Error(`Unable to create operational root Rem "${rootName}".`);
+  await root.setParent(null);
+  await root.setText(await toRichText(plugin, rootName));
+  await root.setIsFolder(true);
+  return root;
+}
+
 const childRemCacheByPlugin = new WeakMap<ReactRNPlugin, Map<string, string>>();
 const childRemPendingByPlugin = new WeakMap<ReactRNPlugin, Map<string, Promise<RemObject>>>();
 
@@ -536,6 +547,24 @@ export async function restoreSnapshotNode(plugin: ReactRNPlugin, parent: RemObje
   if (node.practiceDirection) {
     await rem.setEnablePractice(node.practiceDirection !== "none");
     await rem.setPracticeDirection(node.practiceDirection);
+  }
+  for (const tag of node.tags ?? []) {
+    const existing = (await plugin.rem.findOne(tag.id)) ?? (await plugin.rem.findByName(await toRichText(plugin, tag.text), null));
+    if (existing) await rem.addTag(existing);
+  }
+  for (const property of node.powerupProperties ?? []) {
+    await rem.addPowerup(property.powerupCode);
+    await rem.setPowerupProperty(
+      property.powerupCode,
+      property.slot,
+      Array.isArray(property.richText) ? (property.richText as RichTextInterface) : await toRichText(plugin, property.richText as RichTextish),
+    );
+  }
+  for (const property of node.tagProperties ?? []) {
+    await rem.setTagPropertyValue(
+      property.propertyId,
+      Array.isArray(property.richText) ? (property.richText as RichTextInterface) : await toRichText(plugin, property.richText as RichTextish),
+    );
   }
   for (const child of node.children) await restoreSnapshotNode(plugin, rem, child);
   return rem;

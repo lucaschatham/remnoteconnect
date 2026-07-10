@@ -27,11 +27,16 @@ RemNoteConnect is local-first automation for RemNote. The main risk is not a rem
 - `undo` reverses journaled operations where the underlying Rem IDs still exist.
 - `backupGraph` is explicit disaster recovery, not normal undo.
 - `emptyTrash` is intentionally separate from soft delete.
+- Write-ahead undo is persisted before reversible writes.
+- Irreversible plans are bound to a short-lived, single-use approval nonce.
+- Bridge generations prevent late results from an old socket being accepted by a new connection.
 
 ## Limits Of The Controls
 
 - Read-only mode does not protect against someone who can turn it off with a valid token.
 - Dry-runs do not prove the user intended the targets; they only expose the target set.
+- The TTY approval challenge reduces accidental automation but is not an adversarial boundary against software controlling the entire Mac.
+- An in-flight timeout cannot prove whether RemNote applied a write, so durable jobs stop in `outcome_unknown` instead of replaying.
 - Backups restore copies with new IDs, so inbound references and scheduling history are not preserved.
 - A local attacker with user-level access may be able to read local app-support files.
 

@@ -94,6 +94,7 @@ function restartDaemon() {
 try {
   const before = await call("status");
   assert(before.bridge?.connected === true, "Bridge must be connected before chaos validation.");
+  const priorReadonly = before.readonlyMode === true;
 
   const restart = restartDaemon();
   if (restart.mode === "spawn") {
@@ -102,13 +103,16 @@ try {
   }
   await waitForHealth(true, 15_000);
   const after = await waitForBridge(45_000);
+  await call("readonly", { mode: "off" });
 
   const e2e = spawn(process.execPath, ["scripts/e2e.mjs"], { cwd: root, stdio: "inherit", env: process.env });
   const code = await new Promise((resolve) => e2e.on("close", resolve));
   assert(code === 0, `E2E failed after daemon restart with exit code ${code}.`);
+  if (priorReadonly) await call("readonly", { mode: "on" });
 
   console.log(JSON.stringify({ status: "PASS", ...restart, bridge: after.bridge }, null, 2));
 } catch (error) {
+  await call("readonly", { mode: "on" }).catch(() => undefined);
   console.error(JSON.stringify({ status: "FAIL", message: error instanceof Error ? error.message : String(error) }, null, 2));
   process.exitCode = 1;
 }

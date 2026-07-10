@@ -12,6 +12,7 @@ import {
 } from "@remnoteconnect/shared";
 import type { DaemonConfig } from "./config.js";
 import { isAllowedOrigin, safeTokenEqual } from "./security.js";
+import type { PairingStore } from "./pairing.js";
 
 type PendingJob = {
   jobId: string;
@@ -22,6 +23,8 @@ type PendingJob = {
   resolve: (value: unknown) => void;
   reject: (error: ApiError) => void;
   progress: Array<{ completed: number; total: number; message?: string; at: number }>;
+  bridgeGeneration: number;
+  socket: WebSocket;
 };
 
 type JobRecord = {
@@ -70,8 +73,18 @@ export class PluginBridge {
   private connectedAt?: Date;
   private pending = new Map<string, PendingJob>();
   private jobs = new Map<string, JobRecord>();
+  private bridgeGeneration = 0;
+  private readonly connectedListeners = new Set<() => void>();
 
-  constructor(private readonly config: DaemonConfig) {}
+  constructor(
+    private readonly config: DaemonConfig,
+    private readonly pairing?: PairingStore,
+  ) {}
+
+  onConnected(listener: () => void): () => void {
+    this.connectedListeners.add(listener);
+    return () => this.connectedListeners.delete(listener);
+  }
 
   createWebSocketServer(): WebSocketServer {
     const wss = new WebSocketServer({ noServer: true, maxPayload: BRIDGE_MAX_PAYLOAD_BYTES });
@@ -135,6 +148,7 @@ export class PluginBridge {
       throw {
         code: "plugin_disconnected",
         message: "RemNote plugin is not connected to the local daemon.",
+        details: { dispatched: false },
       } satisfies ApiError;
     }
     if (options.signal?.aborted === true) {
@@ -145,7 +159,9 @@ export class PluginBridge {
     }
 
     const jobId = randomUUID();
-    const message = { type: "job", jobId, action, params };
+    const socket = this.ws;
+    const generation = this.bridgeGeneration;
+    const message = { type: "job", jobId, action, params, bridgeGeneration: generation };
     const result = new Promise<unknown>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(jobId);
@@ -155,7 +171,7 @@ export class PluginBridge {
           progress: this.jobs.get(jobId)?.progress ?? [],
           updatedAt: Date.now(),
         });
-        reject({ code: "timeout", message: `Timed out waiting for plugin job ${jobId}` });
+        reject({ code: "timeout", message: `Timed out waiting for plugin job ${jobId}`, details: { dispatched: true, outcomeUnknown: true } });
       }, timeoutMs);
 
       const pendingJob: PendingJob = {
@@ -167,6 +183,8 @@ export class PluginBridge {
         resolve,
         reject,
         progress: [],
+        bridgeGeneration: generation,
+        socket,
       };
       this.pending.set(jobId, pendingJob);
       this.setJob(jobId, { status: "pending", action, progress: pendingJob.progress, updatedAt: Date.now() });
@@ -177,18 +195,19 @@ export class PluginBridge {
           clearTimeout(timeout);
           this.pending.delete(jobId);
           this.setJob(jobId, { status: "aborted", action, progress: pendingJob.progress, updatedAt: Date.now() });
-          reject({ code: "aborted", message: `Aborted plugin job ${jobId}` });
+          reject({ code: "aborted", message: `Aborted plugin job ${jobId}`, details: { dispatched: true, outcomeUnknown: true } });
         },
         { once: true },
       );
     });
 
-    this.ws.send(JSON.stringify(message));
+    socket.send(JSON.stringify(message));
     return result;
   }
 
   private attach(ws: WebSocket): void {
     let authenticated = false;
+    let connectionGeneration = 0;
     let alive = true;
     const heartbeat = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return;
@@ -225,13 +244,24 @@ export class PluginBridge {
 
       if (!authenticated) {
         const hello = PluginHelloSchema.safeParse(parsed);
-        if (!hello.success || !safeTokenEqual(hello.data.token, this.config.token)) {
+        if (!hello.success) {
+          ws.close(1008, "unauthorized");
+          return;
+        }
+        if (!safeTokenEqual(hello.data.token, this.config.token)) {
+          if (this.pairing?.consume(hello.data.token)) {
+            ws.send(JSON.stringify({ type: "hello_ack", pairedToken: this.config.token, daemonVersion: DAEMON_VERSION, daemonBuildHash: BUILD_HASH }));
+            ws.close(1000, "pairing complete");
+            return;
+          }
           ws.close(1008, "unauthorized");
           return;
         }
         if (!this.replaceConnection(ws, hello.data)) return;
+        connectionGeneration = this.bridgeGeneration;
         authenticated = true;
-        ws.send(JSON.stringify({ type: "hello_ack", daemonVersion: DAEMON_VERSION, daemonBuildHash: BUILD_HASH }));
+        ws.send(JSON.stringify({ type: "hello_ack", daemonVersion: DAEMON_VERSION, daemonBuildHash: BUILD_HASH, bridgeGeneration: connectionGeneration }));
+        for (const listener of this.connectedListeners) queueMicrotask(listener);
         return;
       }
 
@@ -243,20 +273,21 @@ export class PluginBridge {
 
       const result = PluginResultSchema.safeParse(parsed);
       if (result.success) {
-        this.completeJob(result.data.jobId, result.data.result, result.data.error ?? null);
+        this.completeJob(result.data.jobId, result.data.result, result.data.error ?? null, ws, connectionGeneration, result.data.bridgeGeneration ?? connectionGeneration);
         return;
       }
 
       const progress = parsed as {
         type?: string;
         jobId?: string;
+        bridgeGeneration?: number;
         completed?: number;
         total?: number;
         message?: string;
       };
       if (progress.type === "progress" && progress.jobId) {
         const job = this.pending.get(progress.jobId);
-        if (!job) return;
+        if (!job || job.socket !== ws || job.bridgeGeneration !== connectionGeneration || (progress.bridgeGeneration ?? connectionGeneration) !== connectionGeneration) return;
         job.progress.push({
           completed: Number(progress.completed ?? 0),
           total: Number(progress.total ?? 0),
@@ -292,12 +323,21 @@ export class PluginBridge {
     this.ws = ws;
     this.hello = hello;
     this.connectedAt = new Date();
+    this.bridgeGeneration += 1;
     return true;
   }
 
-  private completeJob(jobId: string, result: unknown, error: { code: string; message: string; details?: unknown } | null): void {
+  private completeJob(
+    jobId: string,
+    result: unknown,
+    error: { code: string; message: string; details?: unknown } | null,
+    socket: WebSocket,
+    connectionGeneration: number,
+    resultGeneration: number,
+  ): void {
     const job = this.pending.get(jobId);
     if (!job) return;
+    if (job.socket !== socket || job.bridgeGeneration !== connectionGeneration || resultGeneration !== connectionGeneration) return;
     clearTimeout(job.timeout);
     this.pending.delete(jobId);
     if (error) {
@@ -330,6 +370,11 @@ export class PluginBridge {
       code === "dry_run_mismatch" ||
       code === "magnitude_guard" ||
       code === "readonly_mode" ||
+      code === "approval_required" ||
+      code === "approval_invalid" ||
+      code === "experimental_disabled" ||
+      code === "outcome_unknown" ||
+      code === "unsafe_parameter" ||
       code === "irreversible_budget_exceeded" ||
       code === "forbidden_target" ||
       code === "backup_failed" ||
@@ -346,7 +391,7 @@ export class PluginBridge {
       clearTimeout(job.timeout);
       this.pending.delete(jobId);
       this.setJob(jobId, { status: "error", action: job.action, progress: job.progress, updatedAt: Date.now() });
-      job.reject({ code, message });
+      job.reject({ code, message, details: { dispatched: true, outcomeUnknown: true } });
     }
   }
 

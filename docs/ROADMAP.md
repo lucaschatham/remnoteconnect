@@ -1,18 +1,21 @@
 # Roadmap
 
-## Stable In v0.3
+## Stable In v0.4
 
 - Local daemon on `127.0.0.1`.
 - RemNote desktop plugin bridge.
 - CLI and HTTP action envelope.
 - Read-only mode.
-- Dry-run and exact-count approval patterns.
+- Registry-backed JSON parameter schemas and universal CLI invocation.
+- Write-ahead undo, exact recursive delete plans, one-time irreversible approvals, and token pairing.
+- Durable-job pause and outcome-unknown handling.
 - Basic document, flashcard, map, search, backup, undo, and cleanup workflows.
 
-## Experimental In v0.3
+## Disabled Or Experimental In v0.4
 
 - Image occlusion and advanced media workflows.
-- Scheduler mutation.
+- Scheduler mutation and generated-card deletion are disabled pending reversible SDK support.
+- Structural merge is disabled pending complete inverse-reference validation.
 - Large graph cleanup beyond disposable test scenarios.
 - Advanced RemNote properties, portals, and rich media coverage.
 
@@ -24,7 +27,7 @@
 - RemNote marketplace or unlisted plugin packaging if the permission model and review constraints are acceptable.
 - Broader OS support after the Mac local workflow is stable.
 
-## Not Planned For v0.3
+## Not Planned For v0.4
 
 - npm package publishing.
 - Hosted cloud bridge.

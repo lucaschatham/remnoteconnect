@@ -1,16 +1,15 @@
 import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1;
-export const REMNOTE_CONNECT_VERSION = "0.3.2";
+export const REMNOTE_CONNECT_VERSION = "0.4.0";
 export const DAEMON_VERSION = REMNOTE_CONNECT_VERSION;
 export const PLUGIN_VERSION = REMNOTE_CONNECT_VERSION;
-export const BUILD_HASH = "public-v0.3.2";
+export const BUILD_HASH = "public-v0.4.0";
 export const DEFAULT_DAEMON_HOST = "127.0.0.1";
 export const DEFAULT_DAEMON_PORT = 8766;
 export const DEFAULT_DAEMON_URL = `http://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}`;
 export const DEFAULT_BRIDGE_URL = `ws://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}/bridge`;
 export const MANAGED_ROOT_NAME = "RemNoteConnect";
-export const IRREVERSIBLE_RECONFIRM_PHRASE = "I understand irreversible RemNote operations cannot be undone";
 
 export const ApiEnvelopeSchema = z.object({
   action: z.string().min(1),
@@ -36,6 +35,11 @@ export type ErrorCode =
   | "dry_run_mismatch"
   | "magnitude_guard"
   | "readonly_mode"
+  | "approval_required"
+  | "approval_invalid"
+  | "experimental_disabled"
+  | "outcome_unknown"
+  | "unsafe_parameter"
   | "irreversible_budget_exceeded"
   | "forbidden_target"
   | "backup_failed"
@@ -57,6 +61,7 @@ export const PluginJobSchema = z.object({
   jobId: z.string(),
   action: z.string(),
   params: z.record(z.string(), z.unknown()).optional().default({}),
+  bridgeGeneration: z.number().int().nonnegative(),
 });
 
 export type PluginJob = z.infer<typeof PluginJobSchema>;
@@ -75,6 +80,7 @@ export type PluginHello = z.infer<typeof PluginHelloSchema>;
 export const PluginResultSchema = z.object({
   type: z.literal("result"),
   jobId: z.string(),
+  bridgeGeneration: z.number().int().nonnegative().optional(),
   result: z.unknown().optional(),
   error: z
     .object({
@@ -113,6 +119,8 @@ export type RemSnapshotNode = {
   isCardItem?: boolean;
   practiceDirection?: "forward" | "backward" | "none" | "both";
   tags?: Array<{ id: string; text: string }>;
+  powerupProperties?: Array<{ powerupCode: string; slot: string; richText?: unknown }>;
+  tagProperties?: Array<{ propertyId: string; richText?: unknown }>;
   cards?: Array<Record<string, unknown>>;
   children: RemSnapshotNode[];
 };
@@ -129,6 +137,11 @@ export type RemSnapshot = {
 
 export type ActionHandler = "daemon" | "plugin" | "planned";
 
+export type ActionEffect = "read" | "write" | "irreversible";
+export type DryRunBehavior = "unsupported" | "preview" | "required";
+export type UndoStrategy = "none" | "writeAhead" | "outcomeJournal";
+export type SchedulerCapability = "none" | "disabled" | "verified";
+
 export type ActionMetadata = {
   name: string;
   summary: string;
@@ -143,10 +156,56 @@ export type ActionMetadata = {
   cliName: string;
   handler: ActionHandler;
   implemented: boolean;
+  effect: ActionEffect;
+  dryRunBehavior: DryRunBehavior;
+  undoStrategy: UndoStrategy;
+  durableJobAllowed: boolean;
+  schedulerCapability: SchedulerCapability;
 };
 
-function action(meta: ActionMetadata): ActionMetadata {
-  return meta;
+type ActionMetadataInput = Omit<
+  ActionMetadata,
+  "effect" | "dryRunBehavior" | "undoStrategy" | "durableJobAllowed" | "schedulerCapability"
+>;
+
+const WRITE_AHEAD_ACTIONS = new Set([
+  "renameRem",
+  "moveRem",
+  "changeDeck",
+  "bulkMove",
+  "deleteRem",
+  "deleteNotes",
+  "bulkDelete",
+  "bulkRetag",
+  "normalizeText",
+  "rewriteNativeLinks",
+  "mergeRems",
+  "updateFlashcard",
+  "updateDocument",
+  "setProperty",
+  "restoreTombstone",
+]);
+
+function action(meta: ActionMetadataInput): ActionMetadata {
+  const effect: ActionEffect = meta.irreversible ? "irreversible" : meta.mutates ? "write" : "read";
+  const dryRunBehavior: DryRunBehavior = !meta.mutates
+    ? "unsupported"
+    : meta.bulk || meta.magnitudeGuarded || meta.irreversible
+      ? "required"
+      : "preview";
+  const undoStrategy: UndoStrategy = !meta.mutates
+    ? "none"
+    : WRITE_AHEAD_ACTIONS.has(meta.name) && meta.reversible
+      ? "writeAhead"
+      : "outcomeJournal";
+  return {
+    ...meta,
+    effect,
+    dryRunBehavior,
+    undoStrategy,
+    durableJobAllowed: meta.name === "createFlashcardsAsync" || meta.name === "importAsync",
+    schedulerCapability: meta.name === "answerCard" || meta.name === "deleteFlashcards" ? "disabled" : "none",
+  };
 }
 
 export function retryableBridgeError(error: unknown): boolean {
@@ -258,7 +317,7 @@ export const actionMetadata = {
   }),
   reconfirmIrreversibleBudget: action({
     name: "reconfirmIrreversibleBudget",
-    summary: "Reset the irreversible operation session budget after explicit human re-confirmation.",
+    summary: "Reset the irreversible session budget with a TTY-issued, single-use approval nonce.",
     mutates: false,
     reversible: true,
     irreversible: false,
@@ -268,6 +327,34 @@ export const actionMetadata = {
     minimalReturn: "{irreversibleRemaining}",
     cliName: "reconfirm-irreversible",
     handler: "daemon",
+    implemented: true,
+  }),
+  approveIrreversible: action({
+    name: "approveIrreversible",
+    summary: "Issue a short-lived, single-use approval nonce bound to one irreversible dry-run plan.",
+    mutates: false,
+    reversible: true,
+    irreversible: false,
+    bulk: false,
+    requiresDryRunHash: false,
+    magnitudeGuarded: false,
+    minimalReturn: "{approvalNonce,expiresAt}",
+    cliName: "approve-irreversible",
+    handler: "daemon",
+    implemented: true,
+  }),
+  init: action({
+    name: "init",
+    summary: "Create or verify the RemNoteConnect operational root and Trash hierarchy.",
+    mutates: true,
+    reversible: true,
+    irreversible: false,
+    bulk: false,
+    requiresDryRunHash: false,
+    magnitudeGuarded: false,
+    minimalReturn: "{rootId,trashId}",
+    cliName: "init",
+    handler: "plugin",
     implemented: true,
   }),
   rotateToken: action({
@@ -281,6 +368,20 @@ export const actionMetadata = {
     magnitudeGuarded: false,
     minimalReturn: "{rotated}",
     cliName: "rotate-token",
+    handler: "daemon",
+    implemented: true,
+  }),
+  pair: action({
+    name: "pair",
+    summary: "Generate a short-lived code for pairing a local plugin without embedding the daemon token.",
+    mutates: false,
+    reversible: true,
+    irreversible: false,
+    bulk: false,
+    requiresDryRunHash: false,
+    magnitudeGuarded: false,
+    minimalReturn: "{code,expiresAt}",
+    cliName: "pair",
     handler: "daemon",
     implemented: true,
   }),
@@ -457,7 +558,7 @@ export const actionMetadata = {
   }),
   deleteFlashcards: action({
     name: "deleteFlashcards",
-    summary: "Remove generated cards, not Rem.",
+    summary: "Reserved scheduler-card removal action; disabled until scheduling state is reversible.",
     mutates: true,
     reversible: false,
     irreversible: true,
@@ -533,7 +634,7 @@ export const actionMetadata = {
     reversible: false,
     irreversible: true,
     bulk: true,
-    requiresDryRunHash: false,
+    requiresDryRunHash: true,
     magnitudeGuarded: true,
     minimalReturn: "{count}",
     cliName: "undo-clear",
@@ -652,7 +753,7 @@ export const actionMetadata = {
     irreversible: false,
     bulk: true,
     requiresDryRunHash: false,
-    magnitudeGuarded: false,
+    magnitudeGuarded: true,
     minimalReturn: "{count,ids}",
     cliName: "create-flashcards",
     handler: "plugin",
@@ -826,7 +927,7 @@ export const actionMetadata = {
     irreversible: false,
     bulk: true,
     requiresDryRunHash: false,
-    magnitudeGuarded: false,
+    magnitudeGuarded: true,
     minimalReturn: "{count,ids}",
     cliName: "add-notes",
     handler: "plugin",
@@ -1172,7 +1273,7 @@ export const actionMetadata = {
     irreversible: false,
     bulk: true,
     requiresDryRunHash: false,
-    magnitudeGuarded: false,
+    magnitudeGuarded: true,
     minimalReturn: "{jobId}",
     cliName: "create-flashcards-async",
     handler: "daemon",
@@ -1186,7 +1287,7 @@ export const actionMetadata = {
     irreversible: false,
     bulk: true,
     requiresDryRunHash: false,
-    magnitudeGuarded: false,
+    magnitudeGuarded: true,
     minimalReturn: "{jobId}",
     cliName: "import-async",
     handler: "daemon",
@@ -1374,6 +1475,196 @@ export const unsupportedAnkiActions = [
   "setDueDate",
   "getReviewsOfCards",
 ] as const;
+
+const GenericParamsSchema = z.looseObject({});
+const IdParamsSchema = z.looseObject({
+  id: z.string().min(1).optional(),
+  remId: z.string().min(1).optional(),
+  verbose: z.boolean().optional(),
+});
+const TargetParamsSchema = z.looseObject({
+  id: z.string().min(1).optional(),
+  remId: z.string().min(1).optional(),
+  remIds: z.array(z.string().min(1)).optional(),
+  query: z.string().min(1).optional(),
+  dryRun: z.boolean().optional(),
+  confirm: z.boolean().optional(),
+  confirmCount: z.number().int().nonnegative().optional(),
+  verbose: z.boolean().optional(),
+});
+
+const ACTION_PARAM_SCHEMAS: Record<string, z.ZodType<Record<string, unknown>>> = {
+  readonly: z.looseObject({ mode: z.enum(["on", "off", "status"]).optional(), enabled: z.boolean().optional() }),
+  approveIrreversible: z.looseObject({
+    stage: z.enum(["challenge", "approve"]).optional(),
+    sessionReset: z.boolean().optional(),
+    action: z.string().min(1).optional(),
+    fromDryRun: z.string().min(1).optional(),
+    confirmCount: z.number().int().nonnegative().optional(),
+    challengeId: z.string().min(16).optional(),
+    response: z.string().min(1).optional(),
+  }),
+  reconfirmIrreversibleBudget: z.looseObject({ approvalNonce: z.string().min(16) }),
+  jobStatus: z.looseObject({ jobId: z.string().min(1) }),
+  jobWait: z.looseObject({ jobId: z.string().min(1), timeoutMs: z.number().positive().optional() }),
+  undo: z.looseObject({ opId: z.string().min(1) }),
+  undoClear: z.looseObject({
+    opId: z.string().min(1).optional(),
+    dryRun: z.boolean().optional(),
+    confirm: z.boolean().optional(),
+    confirmCount: z.number().int().nonnegative().optional(),
+    fromDryRun: z.string().min(16).optional(),
+    approvalNonce: z.string().min(16).optional(),
+  }),
+  emptyTrash: z.looseObject({
+    tombstoneOpId: z.string().min(1).optional(),
+    dryRun: z.boolean().optional(),
+    confirm: z.boolean().optional(),
+    confirmCount: z.number().int().nonnegative().optional(),
+    fromDryRun: z.string().min(16).optional(),
+    approvalNonce: z.string().min(16).optional(),
+    force: z.boolean().optional(),
+  }),
+  answerCard: z.looseObject({ cardId: z.string().min(1), score: z.number().int().min(0).max(3) }),
+  createFolder: z.looseObject({ path: z.string().min(1), asDocument: z.boolean().optional(), dryRun: z.boolean().optional() }),
+  createDeck: z.looseObject({ deck: z.string().min(1).optional(), deckName: z.string().min(1).optional(), dryRun: z.boolean().optional() }),
+  renameRem: z.looseObject({
+    id: z.string().min(1).optional(),
+    remId: z.string().min(1).optional(),
+    text: z.string().optional(),
+    newName: z.string().optional(),
+    dryRun: z.boolean().optional(),
+    confirm: z.boolean().optional(),
+  }),
+  deleteRem: TargetParamsSchema,
+  deleteNotes: TargetParamsSchema,
+  bulkDelete: TargetParamsSchema,
+  moveRem: TargetParamsSchema,
+  bulkMove: TargetParamsSchema,
+  bulkRetag: TargetParamsSchema,
+  normalizeText: TargetParamsSchema,
+  getRem: IdParamsSchema,
+  getFlashcard: IdParamsSchema,
+  restoreTombstone: z.looseObject({ opId: z.string().min(1).optional(), id: z.string().min(1).optional(), remId: z.string().min(1).optional() }),
+};
+
+const EmptyParamsSchema = z.looseObject({});
+const QueryParamsSchema = z.looseObject({ query: z.string().min(1), verbose: z.boolean().optional() });
+const SnapshotTargetSchema = z.looseObject({ id: z.string().min(1).optional(), remId: z.string().min(1).optional() });
+const DocumentWriteSchema = z.looseObject({
+  id: z.string().min(1).optional(),
+  remId: z.string().min(1).optional(),
+  markdown: z.string().optional(),
+  md: z.string().optional(),
+  docSpec: z.record(z.string(), z.unknown()).optional(),
+  parentPath: z.string().optional(),
+  parent: z.string().optional(),
+  externalId: z.string().optional(),
+  dryRun: z.boolean().optional(),
+  confirm: z.boolean().optional(),
+  verbose: z.boolean().optional(),
+});
+const FlashcardWriteSchema = z.looseObject({
+  front: z.unknown().optional(),
+  back: z.unknown().optional(),
+  frontHtml: z.string().optional(),
+  backHtml: z.string().optional(),
+  deckPath: z.string().optional(),
+  deckName: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  externalId: z.string().optional(),
+  batchId: z.string().optional(),
+  type: z.string().optional(),
+  dryRun: z.boolean().optional(),
+  confirm: z.boolean().optional(),
+  verbose: z.boolean().optional(),
+});
+
+Object.assign(ACTION_PARAM_SCHEMAS, {
+  version: EmptyParamsSchema,
+  status: EmptyParamsSchema,
+  capabilities: EmptyParamsSchema,
+  describe: EmptyParamsSchema,
+  doctor: EmptyParamsSchema,
+  metrics: EmptyParamsSchema,
+  scopeProbe: EmptyParamsSchema,
+  pair: z.looseObject({ code: z.string().min(4).optional() }),
+  rotateToken: EmptyParamsSchema,
+  init: z.looseObject({ dryRun: z.boolean().optional() }),
+  listRoots: z.looseObject({ verbose: z.boolean().optional() }),
+  listTombstones: z.looseObject({ verbose: z.boolean().optional() }),
+  auditManagedRoot: EmptyParamsSchema,
+  capabilityProbes: z.looseObject({ runId: z.string().optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional() }),
+  ankiMigrationProbes: z.looseObject({ runId: z.string().optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional() }),
+  multi: z.looseObject({ actions: z.array(z.unknown()) }),
+  journalTail: z.looseObject({ n: z.number().int().positive().max(1000).optional() }),
+  backupGraph: z.looseObject({ timeoutMs: z.number().positive().optional() }),
+  restoreBackup: z.looseObject({ file: z.string().min(1).optional(), path: z.string().min(1).optional(), parentPath: z.string().optional(), confirm: z.boolean().optional() }),
+  confirmMaterialized: z.looseObject({ jobId: z.string().min(1).optional(), batchId: z.string().min(1).optional() }),
+  createRem: z.looseObject({ text: z.string(), backText: z.unknown().optional(), parentPath: z.string().optional(), dryRun: z.boolean().optional(), verbose: z.boolean().optional() }),
+  createFlashcard: FlashcardWriteSchema,
+  createFlashcards: z.looseObject({ cards: z.array(z.record(z.string(), z.unknown())), deckPath: z.string().optional(), batchId: z.string().optional(), throttleMs: z.number().nonnegative().optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional(), confirmCount: z.number().int().nonnegative().optional(), verbose: z.boolean().optional() }),
+  createFlashcardsAsync: z.looseObject({ cards: z.array(z.record(z.string(), z.unknown())), deckPath: z.string().optional(), batchId: z.string().optional(), throttleMs: z.number().nonnegative().optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional(), confirmCount: z.number().int().nonnegative().optional() }),
+  importAsync: z.looseObject({ cards: z.array(z.record(z.string(), z.unknown())).optional(), notes: z.array(z.record(z.string(), z.unknown())).optional(), markdown: z.string().optional(), md: z.string().optional(), parentPath: z.string().optional(), externalId: z.string().optional(), batchId: z.string().optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional(), confirmCount: z.number().int().nonnegative().optional() }),
+  updateFlashcard: z.looseObject({ id: z.string().min(1).optional(), remId: z.string().min(1).optional(), front: z.unknown().optional(), back: z.unknown().optional(), tags: z.array(z.string()).optional(), practiceDirection: z.enum(["forward", "backward", "none", "both"]).optional(), dryRun: z.boolean().optional() }),
+  deleteFlashcards: z.looseObject({ cardId: z.string().min(1).optional(), cardIds: z.array(z.string().min(1)).optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional() }),
+  searchGraph: QueryParamsSchema,
+  searchRem: QueryParamsSchema,
+  searchFlashcards: QueryParamsSchema,
+  findNotes: QueryParamsSchema,
+  findByTag: z.looseObject({ tag: z.string().min(1), verbose: z.boolean().optional() }),
+  findDuplicates: z.looseObject({ by: z.enum(["text", "externalId"]).optional(), verbose: z.boolean().optional() }),
+  findEmpty: z.looseObject({ verbose: z.boolean().optional() }),
+  findOrphans: z.looseObject({ verbose: z.boolean().optional() }),
+  map: z.looseObject({ rootId: z.string().min(1).optional(), id: z.string().min(1).optional(), depth: z.number().int().nonnegative().optional(), includeDeleted: z.boolean().optional() }),
+  getDocument: z.looseObject({ id: z.string().min(1).optional(), remId: z.string().min(1).optional(), format: z.enum(["markdown", "tree"]).optional(), depth: z.number().int().nonnegative().optional() }),
+  createDocument: DocumentWriteSchema,
+  appendToDocument: DocumentWriteSchema,
+  updateDocument: DocumentWriteSchema,
+  exportSubtree: SnapshotTargetSchema,
+  backupSubtree: SnapshotTargetSchema,
+  validateSnapshot: z.looseObject({ snapshot: z.record(z.string(), z.unknown()) }),
+  importSnapshot: z.looseObject({ snapshot: z.record(z.string(), z.unknown()), parentPath: z.string().optional(), confirm: z.boolean().optional(), verbose: z.boolean().optional() }),
+  getProperties: z.looseObject({ id: z.string().min(1).optional(), remId: z.string().min(1).optional(), powerupCode: z.string().optional(), slot: z.string().optional(), propertyId: z.string().optional(), properties: z.array(z.record(z.string(), z.unknown())).optional() }),
+  setProperty: z.looseObject({ id: z.string().min(1).optional(), remId: z.string().min(1).optional(), powerupCode: z.string().optional(), slot: z.string().optional(), propertyId: z.string().optional(), value: z.unknown().optional(), dryRun: z.boolean().optional() }),
+  mergeRems: z.looseObject({ keepId: z.string().min(1), mergeId: z.string().min(1).optional(), mergeIds: z.array(z.string().min(1)).optional(), structural: z.boolean().optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional(), confirmCount: z.number().int().nonnegative().optional() }),
+  rewriteNativeLinks: z.looseObject({ candidates: z.array(z.record(z.string(), z.unknown())).optional(), links: z.array(z.record(z.string(), z.unknown())).optional(), allowPartial: z.boolean().optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional(), confirmCount: z.number().int().nonnegative().optional() }),
+  dryRunDelete: TargetParamsSchema,
+  notesInfo: z.looseObject({ notes: z.array(z.union([z.string(), z.number()])) }),
+  deckNames: EmptyParamsSchema,
+  changeDeck: TargetParamsSchema,
+  addNote: z.looseObject({ note: z.record(z.string(), z.unknown()).optional(), externalId: z.string().optional(), verbose: z.boolean().optional() }),
+  addNotes: z.looseObject({ notes: z.array(z.record(z.string(), z.unknown())), verbose: z.boolean().optional() }),
+  canAddNote: z.looseObject({ note: z.record(z.string(), z.unknown()).optional() }),
+});
+
+export function hasExplicitActionParamSchema(actionName: string): boolean {
+  return Object.hasOwn(ACTION_PARAM_SCHEMAS, actionName);
+}
+
+export function getActionParamSchema(actionName: string): z.ZodType<Record<string, unknown>> {
+  return ACTION_PARAM_SCHEMAS[actionName] ?? GenericParamsSchema;
+}
+
+export function parseActionParams(
+  actionName: string,
+  params: Record<string, unknown>,
+): { success: true; data: Record<string, unknown> } | { success: false; error: z.ZodError } {
+  const parsed = getActionParamSchema(actionName).safeParse(params);
+  return parsed.success ? { success: true, data: parsed.data } : { success: false, error: parsed.error };
+}
+
+export function describeActionMetadata(): Record<string, ActionMetadata & { paramsSchema: Record<string, unknown> }> {
+  return Object.fromEntries(
+    Object.values(actionMetadata).map((meta) => [
+      meta.name,
+      {
+        ...meta,
+        paramsSchema: z.toJSONSchema(getActionParamSchema(meta.name)) as Record<string, unknown>,
+      },
+    ]),
+  );
+}
 
 export const plannedActions = Object.values(actionMetadata)
   .filter((meta) => !meta.implemented)

@@ -11,6 +11,8 @@ import {
   type DurableJobRecord,
 } from "./jobStore.js";
 
+const MAGNITUDE_THRESHOLD = 50;
+
 type PublicJob = Omit<DurableJobRecord, "params"> & { paramsStored: true };
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -57,13 +59,51 @@ function sleep(ms: number): Promise<void> {
 
 export class DurableJobManager {
   private running = new Set<string>();
+  private readonly unsubscribeConnected: () => void;
 
   constructor(
     private readonly config: DaemonConfig,
     private readonly bridge: PluginBridge,
-  ) {}
+    private readonly isReadonly: () => boolean,
+  ) {
+    this.unsubscribeConnected = this.bridge.onConnected(() => void this.resumeSafeJobs());
+  }
+
+  async start(): Promise<void> {
+    const jobs = await readDurableJobs(this.config.appDir);
+    for (const job of jobs.values()) {
+      if (job.status === "running") {
+        if (job.activeItemIndex === undefined) {
+          job.status = this.isReadonly() ? "paused_readonly" : "queued";
+          job.error = undefined;
+        } else {
+          job.status = "outcome_unknown";
+          job.outcomeUnknownAt = new Date().toISOString();
+          job.error = { code: "outcome_unknown", message: "Daemon restarted while this item was in flight; it was not replayed." };
+          await this.reconcileExternalId(job);
+        }
+        await this.save(job);
+      }
+    }
+    await this.resumeSafeJobs();
+  }
+
+  async setReadonly(readonly: boolean): Promise<void> {
+    if (readonly) {
+      const jobs = await readDurableJobs(this.config.appDir);
+      for (const job of jobs.values()) {
+        if (job.status === "queued") {
+          job.status = "paused_readonly";
+          await this.save(job);
+        }
+      }
+      return;
+    }
+    await this.resumeSafeJobs();
+  }
 
   async submit(action: "createFlashcardsAsync" | "importAsync", params: Record<string, unknown>): Promise<ApiResponse> {
+    if (this.isReadonly()) return fail("readonly_mode", `${action} is blocked while read-only mode is enabled.`);
     const total = this.totalFor(action, params);
     if (params.dryRun === true || params.confirm !== true) {
       return ok({
@@ -71,6 +111,12 @@ export class DurableJobManager {
         action,
         count: total,
         warning: `${action} defaults to dry-run. Pass confirm:true to enqueue a durable job.`,
+      });
+    }
+    if (total > MAGNITUDE_THRESHOLD && Number(params.confirmCount) !== total) {
+      return fail("magnitude_guard", `${action} contains ${total} items. Pass confirmCount:${total} to enqueue it.`, {
+        count: total,
+        threshold: MAGNITUDE_THRESHOLD,
       });
     }
     const job = createDurableJob(action, params, total);
@@ -82,7 +128,6 @@ export class DurableJobManager {
   async status(jobId: string): Promise<ApiResponse | undefined> {
     const job = await readDurableJob(this.config.appDir, jobId);
     if (!job) return undefined;
-    if (job.status === "queued" || job.status === "running") void this.kick(job.jobId);
     return ok(publicJob(job));
   }
 
@@ -92,8 +137,9 @@ export class DurableJobManager {
     while (Date.now() <= deadline) {
       last = await readDurableJob(this.config.appDir, jobId);
       if (!last) return fail("not_found", `No durable job found for ${jobId}`);
-      if (last.status === "complete" || last.status === "error") return ok(publicJob(last));
-      await this.kick(jobId);
+      if (last.status === "complete" || last.status === "error" || last.status === "cancelled" || last.status === "outcome_unknown") {
+        return ok(publicJob(last));
+      }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
     return fail("timeout", `Timed out waiting for durable job ${jobId}`, last ? publicJob(last) : undefined);
@@ -118,7 +164,15 @@ export class DurableJobManager {
     this.running.add(jobId);
     try {
       const job = await readDurableJob(this.config.appDir, jobId);
-      if (!job || job.status === "complete" || job.status === "error") return;
+      if (!job || job.status === "complete" || job.status === "error" || job.status === "cancelled" || job.status === "outcome_unknown") return;
+      if (this.isReadonly()) {
+        if (job.status !== "paused_readonly") {
+          job.status = "paused_readonly";
+          await this.save(job);
+        }
+        return;
+      }
+      if (job.status === "paused_readonly") job.status = "queued";
       if (!this.bridge.status().connected) {
         if (job.status !== "queued") {
           job.status = "queued";
@@ -146,7 +200,9 @@ export class DurableJobManager {
       await this.save(job);
     } catch (error) {
       if (retryableBridgeError(error)) {
-        job.status = "queued";
+        const details = asRecord((error as Partial<ApiError>).details);
+        job.status = details.dispatched === false ? "queued" : "outcome_unknown";
+        if (job.status === "outcome_unknown") job.outcomeUnknownAt = new Date().toISOString();
         job.error = publicError(error);
       } else {
         job.status = "error";
@@ -177,6 +233,9 @@ export class DurableJobManager {
         const existingRemId = (await readExternalIdMap(this.config.appDir)).get(externalId);
         if (existingRemId) params.existingRemId = existingRemId;
       }
+      job.activeItemIndex = index;
+      job.activeExternalId = externalId;
+      await this.save(job);
       const result = await this.bridge.runJob(pluginAction, params, itemTimeoutMs);
       const id = idFromResult(result);
       if (id) {
@@ -184,6 +243,9 @@ export class DurableJobManager {
         if (externalId) await appendExternalId(this.config.appDir, { action: job.action, externalId, remId: id });
       }
       job.cursor = index + 1;
+      delete job.activeItemIndex;
+      delete job.activeExternalId;
+      delete job.outcomeUnknownAt;
       job.progress.push({ completed: job.cursor, total: job.total, message: `Processed ${job.cursor}/${job.total}`, at: Date.now() });
       await this.save(job);
       const throttleMs = Number(job.params.throttleMs ?? 0);
@@ -193,6 +255,9 @@ export class DurableJobManager {
 
   private async processDocument(job: DurableJobRecord): Promise<void> {
     if (job.cursor > 0) return;
+    job.activeItemIndex = 0;
+    job.activeExternalId = str(job.params.externalId);
+    await this.save(job);
     const result = await this.bridge.runJob("createDocument", job.params, 10 * 60_000);
     const record = asRecord(result);
     const ids = Array.isArray(record.remIds) ? record.remIds.filter((id): id is string => typeof id === "string") : [];
@@ -201,6 +266,9 @@ export class DurableJobManager {
     const externalId = str(job.params.externalId);
     if (externalId && id) await appendExternalId(this.config.appDir, { action: job.action, externalId, remId: id });
     job.cursor = 1;
+    delete job.activeItemIndex;
+    delete job.activeExternalId;
+    delete job.outcomeUnknownAt;
     job.progress.push({ completed: 1, total: job.total, message: "Processed document import", at: Date.now() });
     await this.save(job);
   }
@@ -219,5 +287,30 @@ export class DurableJobManager {
   private async save(job: DurableJobRecord): Promise<void> {
     job.updatedAt = new Date().toISOString();
     await appendJobSnapshot(this.config.appDir, job);
+  }
+
+  private async reconcileExternalId(job: DurableJobRecord): Promise<void> {
+    if (job.activeItemIndex === undefined || !job.activeExternalId) return;
+    const remId = (await readExternalIdMap(this.config.appDir)).get(job.activeExternalId);
+    if (!remId) return;
+    job.ids = [...new Set([...job.ids, remId])];
+    job.cursor = job.activeItemIndex + 1;
+    delete job.activeItemIndex;
+    delete job.activeExternalId;
+    delete job.outcomeUnknownAt;
+    job.error = undefined;
+    job.status = this.isReadonly() ? "paused_readonly" : "queued";
+  }
+
+  private async resumeSafeJobs(): Promise<void> {
+    if (this.isReadonly() || !this.bridge.status().connected) return;
+    const jobs = await readDurableJobs(this.config.appDir);
+    for (const job of jobs.values()) {
+      if (job.status === "paused_readonly") {
+        job.status = "queued";
+        await this.save(job);
+      }
+      if (job.status === "queued") void this.kick(job.jobId);
+    }
   }
 }

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline/promises";
 
 const DEFAULT_URL = process.env.REMNOTE_CONNECT_URL ?? "http://127.0.0.1:8766";
 const APP_DIR = process.env.REMNOTE_CONNECT_APP_DIR ?? join(homedir(), "Library", "Application Support", "RemNoteConnect");
@@ -11,12 +12,16 @@ const TOKEN_FILE = process.env.REMNOTE_CONNECT_TOKEN_FILE ?? join(APP_DIR, "toke
 function usage() {
   console.error(`Usage:
   rnc describe
+  rnc help [ACTION]
   rnc doctor
   rnc status
   rnc metrics
+  rnc init
+  rnc pair
   rnc readonly on|off|status
   rnc capability-probes [--confirm]
-  rnc reconfirm-irreversible --phrase "I understand irreversible RemNote operations cannot be undone" --confirm
+  rnc approve-irreversible --action ACTION --from-dry-run HASH --confirm-count N
+  rnc reconfirm-irreversible
   rnc rotate-token
   rnc map --depth 3 [--root-id ID]
   rnc get ID
@@ -43,6 +48,9 @@ function usage() {
 	  rnc list-tombstones
 	  rnc backup-graph [--watch] [--timeout-ms N]
   rnc empty-trash [--from-dry-run HASH] [--confirm] [--confirm-count N]
+  rnc undo-clear [OP_ID] [--from-dry-run HASH] [--confirm] [--confirm-count N]
+  rnc call ACTION --params '{"key":"value"}'
+  rnc call ACTION --params @params.json
 
 Options:
   --json       Print JSON even for TSV/Markdown responses.
@@ -199,6 +207,9 @@ function commonParams(flags) {
   if (flags.confirm) params.confirm = true;
   if (flags.confirmCount !== undefined) params.confirmCount = Number(flags.confirmCount);
   if (flags.fromDryRun !== undefined) params.fromDryRun = String(flags.fromDryRun);
+  if (flags.approvalNonce !== undefined) params.approvalNonce = String(flags.approvalNonce);
+  if (flags.force) params.force = true;
+  if (flags.tombstoneOpId !== undefined) params.tombstoneOpId = String(flags.tombstoneOpId);
   if (flags.timeoutMs !== undefined) params.timeoutMs = Number(flags.timeoutMs);
   return params;
 }
@@ -212,21 +223,90 @@ async function readJsonPayload(file) {
   return Array.isArray(parsed) ? { cards: parsed } : parsed;
 }
 
+async function paramsPayload(value, file) {
+  if (file) return JSON.parse(await readFile(String(file), "utf8"));
+  if (typeof value !== "string") return {};
+  if (value.startsWith("@")) return JSON.parse(await readFile(value.slice(1), "utf8"));
+  return JSON.parse(value);
+}
+
+async function approveIrreversible(flags) {
+  const action = flags.action;
+  const fromDryRun = flags.fromDryRun;
+  const confirmCount = Number(flags.confirmCount);
+  if (!action || !fromDryRun || !Number.isInteger(confirmCount) || confirmCount < 0) usage();
+  const binding = { action: String(action), fromDryRun: String(fromDryRun), confirmCount };
+  const challenge = await call("approveIrreversible", { stage: "challenge", ...binding });
+  console.error(`Irreversible action: ${challenge.action}`);
+  console.error(`Exact target count: ${challenge.confirmCount}`);
+  if (Array.isArray(challenge.targetIds) && challenge.targetIds.length > 0) console.error(`Target IDs: ${challenge.targetIds.join(", ")}`);
+  for (const warning of challenge.warnings ?? []) console.error(`Warning: ${warning}`);
+  console.error(`Type this phrase exactly to issue a five-minute, single-use approval nonce:\n${challenge.phrase}`);
+
+  let input;
+  let output;
+  try {
+    input = createReadStream("/dev/tty");
+    output = createWriteStream("/dev/tty");
+  } catch {
+    throw new Error("approve-irreversible requires an interactive /dev/tty; flags and piped stdin are not accepted.");
+  }
+  const readline = createInterface({ input, output, terminal: true });
+  const response = await readline.question("> ");
+  readline.close();
+  input.destroy();
+  output.end();
+  if (response.trim() !== challenge.phrase) throw new Error("Confirmation phrase did not match; no approval nonce was issued.");
+  return call("approveIrreversible", {
+    stage: "approve",
+    ...binding,
+    challengeId: challenge.challengeId,
+    response: response.trim(),
+  });
+}
+
+async function reconfirmIrreversibleBudget() {
+  const challenge = await call("approveIrreversible", { stage: "challenge", sessionReset: true });
+  console.error(`Warning: ${challenge.warnings?.[0] ?? "This permits three more irreversible operations."}`);
+  console.error(`Type this phrase exactly:\n${challenge.phrase}`);
+  const input = createReadStream("/dev/tty");
+  const output = createWriteStream("/dev/tty");
+  const readline = createInterface({ input, output, terminal: true });
+  const response = await readline.question("> ");
+  readline.close();
+  input.destroy();
+  output.end();
+  if (response.trim() !== challenge.phrase) throw new Error("Confirmation phrase did not match; the session budget was not reset.");
+  const approval = await call("approveIrreversible", {
+    stage: "approve",
+    sessionReset: true,
+    challengeId: challenge.challengeId,
+    response: response.trim(),
+  });
+  return call("reconfirmIrreversibleBudget", { approvalNonce: approval.approvalNonce });
+}
+
 async function main() {
   const { args, flags } = parseArgs(process.argv.slice(2));
   const command = args[0];
   if (!command) usage();
 
   let result;
-  if (command === "describe" || command === "doctor" || command === "status" || command === "metrics") {
+  if (command === "help") {
+    const description = await call("describe", {});
+    const action = args[1] ?? flags.action;
+    result = action ? description.actions?.[action] ?? { error: `Unknown action: ${action}` } : description.actions;
+  } else if (command === "describe" || command === "doctor" || command === "status" || command === "metrics" || command === "init" || command === "pair") {
     result = await call(command, commonParams(flags));
   } else if (command === "readonly") {
     const mode = args[1] ?? flags.mode ?? "status";
     result = await call("readonly", { mode });
   } else if (command === "capability-probes") {
     result = await call("capabilityProbes", { ...commonParams(flags), runId: flags.runId });
+  } else if (command === "approve-irreversible") {
+    result = await approveIrreversible(flags);
   } else if (command === "reconfirm-irreversible") {
-    result = await call("reconfirmIrreversibleBudget", { ...commonParams(flags), phrase: flags.phrase });
+    result = await reconfirmIrreversibleBudget();
   } else if (command === "rotate-token") {
     result = await call("rotateToken", commonParams(flags));
   } else if (command === "map") {
@@ -352,6 +432,12 @@ async function main() {
     result = flags.watch ? await backupGraphWithWatch(flags) : await call("backupGraph", commonParams(flags));
   } else if (command === "empty-trash") {
     result = await call("emptyTrash", commonParams(flags));
+  } else if (command === "undo-clear") {
+    result = await call("undoClear", { ...commonParams(flags), opId: args[1] ?? flags.opId });
+  } else if (command === "call") {
+    const action = args[1] ?? flags.action;
+    if (!action) usage();
+    result = await call(String(action), await paramsPayload(flags.params, flags.paramsFile));
   } else {
     usage();
   }

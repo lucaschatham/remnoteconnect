@@ -15,7 +15,9 @@ It provides a small RemNote plugin plus a local daemon. The plugin runs inside R
 
 This plugin requests whole-knowledge-base read/create/modify/delete permission. Only install it if you understand that it is designed to control your local RemNote knowledge base through a local daemon.
 
-The daemon binds to `127.0.0.1`, uses a local bearer token, and defaults dangerous workflows toward dry-run and confirmation. Even so, this is powerful local automation software, not a simple visual plugin.
+The daemon binds to `127.0.0.1`, uses local pairing and bearer authentication, persists undo state before reversible writes, and requires an exact plan plus a one-time approval for irreversible operations. Even so, this is powerful local automation software, not a simple visual plugin.
+
+Scheduler mutation and structural merge are disabled in v0.4 until they can be proven reversible.
 
 Do not paste daemon tokens, private notes, Rem exports, or graph maps into public issues.
 
