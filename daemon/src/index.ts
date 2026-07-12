@@ -29,6 +29,7 @@ try {
   console.log(`Backup dir: ${config.backupDir}`);
   console.log(`Log dir: ${config.logDir}`);
 } catch (error) {
-  app.log.error(error);
-  process.exit(1);
+  console.error("Failed to start RemNoteConnect daemon:", error);
+  await Promise.allSettled([ankiApp.close(), app.close()]);
+  process.exitCode = 1;
 }

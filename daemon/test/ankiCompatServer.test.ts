@@ -186,6 +186,56 @@ describe("AnkiConnect compatibility contract", () => {
     await app.close();
   });
 
+  it("locks the compatibility surface to loopback origins and bounded media paths", async () => {
+    const { app } = await fixture();
+    const deniedHost = await app.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "evil.example:8765" },
+      payload: { action: "version", version: 6 },
+    });
+    expect(deniedHost.statusCode).toBe(403);
+
+    const deniedOrigin = await app.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "127.0.0.1:8765", origin: "https://evil.example" },
+      payload: { action: "version", version: 6 },
+    });
+    expect(deniedOrigin.statusCode).toBe(403);
+
+    const traversal = await app.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "127.0.0.1:8765" },
+      payload: { action: "storeMediaFile", version: 6, params: { filename: "../token", data: "YQ==" } },
+    });
+    expect(traversal.json().error).toContain("invalid media filename");
+
+    const localUrl = await app.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "127.0.0.1:8765" },
+      payload: { action: "storeMediaFile", version: 6, params: { filename: "token.txt", url: "file:///tmp/token" } },
+    });
+    expect(localUrl.json().error).toContain("must use http or https");
+
+    const dir = await mkdtemp(join(tmpdir(), "rnc-anki-non-loopback-"));
+    dirs.push(dir);
+    expect(() =>
+      loadConfig({
+        appDir: dir,
+        backupDir: join(dir, "backups"),
+        logDir: join(dir, "logs"),
+        tokenFile: join(dir, "token"),
+        token: "test-token-test-token",
+        ankiCompatEnabled: true,
+        ankiCompatHost: "0.0.0.0",
+      }),
+    ).toThrow("must bind to a loopback host");
+    await app.close();
+  });
+
   it("creates and reads note, deck, model, and media data with Anki-shaped IDs", async () => {
     const { app, dispatchNative } = await fixture();
     const headers = { host: "127.0.0.1:8765" };

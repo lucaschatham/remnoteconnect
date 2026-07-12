@@ -1724,6 +1724,103 @@ describe("daemon server", () => {
     await bundle.app.close();
   });
 
+  it("routes AnkiConnect requests through native safety and the live plugin bridge", async () => {
+    const bundle = testBundle({ readonlyMode: true });
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    const seenActions: string[] = [];
+    const { ws, ready } = connectPlugin(port, {
+      onJob(message, socket) {
+        seenActions.push(message.action);
+        const result =
+          message.action === "addNote"
+            ? {
+                id: "rem-note-1",
+                path: "Default",
+                cards: [{ id: "rem-card-1", remId: "rem-note-1" }],
+              }
+            : message.action === "notesInfo"
+              ? [
+                  {
+                    id: "rem-note-1",
+                    text: "Question",
+                    backText: "Answer",
+                    path: "Default",
+                    tags: [{ text: "integration" }],
+                    cards: [{ id: "rem-card-1", remId: "rem-note-1" }],
+                    updatedAt: 1_700_000_000_000,
+                  },
+                ]
+              : null;
+        socket.send(JSON.stringify({ type: "result", jobId: message.jobId, result, error: null }));
+      },
+    });
+    await ready;
+
+    const blocked = await bundle.ankiApp.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "127.0.0.1:8765" },
+      payload: {
+        action: "addNote",
+        version: 6,
+        params: { note: { deckName: "Default", modelName: "Basic", fields: { Front: "Question", Back: "Answer" } } },
+      },
+    });
+    expect(blocked.json().error).toContain("read-only mode");
+    expect(seenActions).toEqual([]);
+
+    const writeWindow = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "readonly", version: 1, params: { mode: "off" } },
+    });
+    expect(writeWindow.json().result.readonlyMode).toBe(false);
+
+    const created = await bundle.ankiApp.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "127.0.0.1:8765" },
+      payload: {
+        action: "addNote",
+        version: 6,
+        params: {
+          note: {
+            deckName: "Default",
+            modelName: "Basic",
+            fields: { Front: "Question", Back: "Answer" },
+            tags: ["integration"],
+          },
+        },
+      },
+    });
+    const noteId = created.json().result;
+    expect(Number.isSafeInteger(noteId)).toBe(true);
+
+    const info = await bundle.ankiApp.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "127.0.0.1:8765" },
+      payload: { action: "notesInfo", version: 6, params: { notes: [noteId] } },
+    });
+    expect(info.json().result[0]).toMatchObject({
+      noteId,
+      modelName: "Basic",
+      tags: ["integration"],
+      fields: {
+        Front: { value: "Question", order: 0 },
+        Back: { value: "Answer", order: 1 },
+      },
+    });
+    expect(Number.isSafeInteger(info.json().result[0].cards[0])).toBe(true);
+    expect(seenActions).toEqual(["addNote", "notesInfo"]);
+
+    ws.close();
+    await bundle.ankiApp.close();
+    await bundle.app.close();
+  });
+
   it("caps retained job history after many completed jobs", async () => {
     const bundle = testBundle();
     dirs.push(bundle.dir);
