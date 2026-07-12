@@ -386,7 +386,7 @@ async function dispatchAction(
     if (!jobId) return fail("bad_request", "jobWait requires jobId.");
     return durableJobs.wait(jobId, Number(params.timeoutMs ?? 120_000));
   }
-  if (action === "createFlashcardsAsync" || action === "importAsync") {
+  if (action === "createFlashcardsAsync" || action === "importAsync" || action === "syncAtlasBatch") {
     return durableJobs.submit(action, params);
   }
   if (action === "confirmMaterialized") {

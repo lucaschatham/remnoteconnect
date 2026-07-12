@@ -7,7 +7,7 @@ export type DurableJobStatus = "queued" | "running" | "outcome_unknown" | "pause
 export type DurableJobRecord = {
   schemaVersion: 1;
   jobId: string;
-  action: "createFlashcardsAsync" | "importAsync";
+  action: "createFlashcardsAsync" | "importAsync" | "syncAtlasBatch";
   status: DurableJobStatus;
   createdAt: string;
   updatedAt: string;
@@ -45,7 +45,7 @@ export function createDurableJob(action: DurableJobRecord["action"], params: Rec
 }
 
 function compactFinishedParams(params: Record<string, unknown>): Record<string, unknown> {
-  const keep = ["batchId", "deckPath", "deckName", "parentPath", "externalId"];
+  const keep = ["batchId", "deckPath", "deckName", "parentPath", "externalId", "rootId", "namespace", "sourceRevision", "reconcile", "atlasPayloadStored"];
   const compact: Record<string, unknown> = {};
   for (const key of keep) {
     if (params[key] !== undefined) compact[key] = params[key];

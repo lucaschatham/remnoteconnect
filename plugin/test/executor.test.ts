@@ -16,6 +16,88 @@ async function createCard(graph: FakeRemGraph, front = "front", deckPath = "Deck
 }
 
 describe("plugin executor", () => {
+  it("syncs an Atlas batch in parent order, preserves personal children, and skips unchanged items", async () => {
+    const graph = new FakeRemGraph();
+    const hash = (letter: string) => `sha256:${letter.repeat(64)}`;
+    const first = (await executeAction(graph.plugin, "syncAtlasBatch", {
+      mode: "fast-local",
+      batchId: "atlas-test-001",
+      rootId: graph.root._id,
+      namespace: "learning-atlas",
+      sourceRevision: "test-v1",
+      documents: [
+        {
+          externalId: "atlas:algebra",
+          parentExternalId: "atlas:math",
+          contentHash: hash("a"),
+          markdown: "Algebra [Math]",
+          links: [{ token: "[Math]", targetExternalId: "atlas:math" }],
+        },
+        { externalId: "atlas:math", contentHash: hash("b"), markdown: "Mathematics" },
+      ],
+      flashcards: [
+        { externalId: "atlas:algebra:card:01", parentExternalId: "atlas:algebra", contentHash: hash("c"), front: "What is x?", back: "A variable." },
+      ],
+    })) as { created: number; indexEntries: Array<{ externalId: string; remId: string }>; unchanged: number };
+
+    expect(first.created).toBe(3);
+    const ids = new Map(first.indexEntries.map((entry) => [entry.externalId, entry.remId]));
+    const math = graph.rems.get(ids.get("atlas:math")!);
+    const algebra = graph.rems.get(ids.get("atlas:algebra")!);
+    const card = graph.rems.get(ids.get("atlas:algebra:card:01")!);
+    expect(algebra?.parent).toBe(math?._id);
+    expect(card?.parent).toBe(algebra?._id);
+    expect(String(algebra?.text)).toContain(`[[${math?._id}]]`);
+    expect(card?.practiceEnabled).toBe(true);
+
+    const personal = await graph.createChild(algebra!, "Personal proof note");
+    const second = (await executeAction(graph.plugin, "syncAtlasBatch", {
+      mode: "fast-local",
+      batchId: "atlas-test-002",
+      rootId: graph.root._id,
+      namespace: "learning-atlas",
+      sourceRevision: "test-v1",
+      index: first.indexEntries,
+      documents: [
+        { externalId: "atlas:math", contentHash: hash("b"), markdown: "Mathematics" },
+        { externalId: "atlas:algebra", parentExternalId: "atlas:math", contentHash: hash("d"), markdown: "Updated algebra" },
+      ],
+      flashcards: [
+        { externalId: "atlas:algebra:card:01", parentExternalId: "atlas:algebra", contentHash: hash("c"), front: "What is x?", back: "A variable." },
+      ],
+    })) as { created: number; updated: number; unchanged: number };
+
+    expect(second).toMatchObject({ created: 0, updated: 1, unchanged: 2 });
+    expect(graph.rems.get(personal._id)?.parent).toBe(algebra?._id);
+    expect(graph.rems.get(algebra!._id)?.powerupProperties.get("remnoteconnect-local-v3:atlasSync")).toContain("atlas:algebra");
+
+    const reconciled = (await executeAction(graph.plugin, "syncAtlasBatch", {
+      mode: "fast-local", batchId: "atlas-test-003", rootId: graph.root._id, namespace: "learning-atlas", sourceRevision: "test-v1", reconcile: true,
+      documents: [
+        { externalId: "atlas:math", contentHash: hash("b"), markdown: "Mathematics" },
+        { externalId: "atlas:algebra", parentExternalId: "atlas:math", contentHash: hash("d"), markdown: "Updated algebra" },
+      ],
+      flashcards: [{ externalId: "atlas:algebra:card:01", parentExternalId: "atlas:algebra", contentHash: hash("c"), front: "What is x?", back: "A variable." }],
+    })) as { created: number; updated: number; unchanged: number };
+    expect(reconciled).toMatchObject({ created: 0, updated: 0, unchanged: 3 });
+  });
+
+  it("rejects an indexed Atlas Rem outside the configured root", async () => {
+    const graph = new FakeRemGraph();
+    const foreignRoot = graph.createTopLevel("Foreign Atlas");
+    const hash = `sha256:${"f".repeat(64)}`;
+    const foreign = (await executeAction(graph.plugin, "syncAtlasBatch", {
+      mode: "fast-local", batchId: "foreign-1", rootId: foreignRoot._id, namespace: "learning-atlas", sourceRevision: "test",
+      documents: [{ externalId: "atlas:foreign", contentHash: hash, markdown: "Foreign" }], flashcards: [],
+    })) as { indexEntries: unknown[] };
+
+    await expect(executeAction(graph.plugin, "syncAtlasBatch", {
+      mode: "fast-local", batchId: "local-1", rootId: graph.root._id, namespace: "learning-atlas", sourceRevision: "test",
+      index: foreign.indexEntries,
+      documents: [{ externalId: "atlas:foreign", contentHash: hash, markdown: "Foreign" }], flashcards: [],
+    })).rejects.toMatchObject({ code: "forbidden_target" });
+  });
+
   it("keeps registry plugin actions in one-to-one parity with executor cases", () => {
     const source = readFileSync(new URL("../src/executor.ts", import.meta.url), "utf8");
     const cases = new Set([...source.matchAll(/case\s+"([^"]+)"/g)].map((match) => match[1]));

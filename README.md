@@ -72,6 +72,23 @@ flowchart LR
 
 RemNote does not expose a general backend API for this use case, so writes happen through a RemNote frontend plugin. The local daemon handles auth, request validation, safety gates, job state, backups, and CLI/API ergonomics.
 
+### Fast Local Atlas Sync (experimental)
+
+`sync-atlas` is the high-throughput path for a personal Learning Atlas. The full source graph remains in local JSON, Obsidian, or a webpage; RemNote receives only the branch currently being studied. It sends one durable job over the existing local WebSocket rather than one request per Rem.
+
+1. Create a disposable or deliberately dedicated RemNote root for the active Atlas branch.
+2. Set `REMNOTE_CONNECT_FAST_LOCAL_ROOT_ID` before starting the daemon.
+3. Sync a manifest containing stable `externalId` and `sha256:<hash>` values:
+
+```sh
+node scripts/rnc.mjs sync-atlas \
+  --manifest ./atlas-batch.json \
+  --root-id REM_ROOT_ID \
+  --fast-local --wait
+```
+
+The daemon rejects a missing or mismatched root, remote modes, duplicate IDs, parent cycles, card parents, and any move/delete/merge operation. The batch only creates or updates Rems marked with RemNoteConnect Atlas metadata; personal children, evidence, and unmarked cards are never adopted or removed. Re-run the same manifest with `--reconcile` only after an `outcome_unknown` result.
+
 ## Safety Model
 
 RemNoteConnect can request whole-knowledge-base access, so the safety model is explicit:

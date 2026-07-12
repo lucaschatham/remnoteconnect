@@ -17,6 +17,7 @@ export type DaemonConfig = {
   token: string;
   allowedOrigins: string[];
   readonlyMode: boolean;
+  fastLocalRootId?: string;
 };
 
 export function defaultAppDir(): string {
@@ -74,6 +75,7 @@ export function loadConfig(overrides: Partial<DaemonConfig> = {}): DaemonConfig 
     tokenFile,
     token: overrides.token ?? process.env.REMNOTE_CONNECT_TOKEN ?? loadOrCreateToken(tokenFile),
     readonlyMode: overrides.readonlyMode ?? process.env.REMNOTE_CONNECT_READONLY_MODE !== "off",
+    fastLocalRootId: overrides.fastLocalRootId ?? (process.env.REMNOTE_CONNECT_FAST_LOCAL_ROOT_ID?.trim() || undefined),
     allowedOrigins: overrides.allowedOrigins ?? [
       "http://localhost:8080",
       "http://127.0.0.1:8080",

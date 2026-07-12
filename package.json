@@ -15,6 +15,7 @@
     "smoke": "node scripts/smoke.mjs",
     "e2e": "node scripts/e2e.mjs",
     "bench": "node scripts/bench.mjs",
+    "bench:atlas": "node scripts/bench-atlas-sync.mjs",
     "live:restore": "node scripts/live-restore.mjs",
     "live:security": "node scripts/live-security.mjs",
     "live:scope": "node scripts/live-scope.mjs",

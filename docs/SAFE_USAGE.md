@@ -45,6 +45,9 @@ RemNoteConnect can operate on an entire RemNote knowledge base after the desktop
 - Treat `emptyTrash` as irreversible.
 - `emptyTrash` counts every descendant, not only the visible tombstone folder.
 - An `outcome_unknown` durable job requires reconciliation; do not resubmit it blindly.
+- For `sync-atlas`, pin `REMNOTE_CONNECT_FAST_LOCAL_ROOT_ID` to one dedicated root and pass the same value through `--root-id`. The fast path never permits cross-root writes, moves, merges, or deletes.
+- Keep personal notes and cards unmarked beneath the synced skill Rems. Atlas sync updates only Rems with its own metadata; clone a generated card before making personal edits you want to preserve.
+- Use `node scripts/rnc.mjs sync-atlas --manifest FILE --root-id ROOT --fast-local --reconcile` after an Atlas job reports `outcome_unknown`.
 - Scheduler mutation and structural merge are disabled in v0.4.
 - Treat snapshot restore as disaster recovery, not true undo. Restored Rem are copies with new IDs.
 - Do not run broad writes on a real graph until the dry-run output makes sense.
