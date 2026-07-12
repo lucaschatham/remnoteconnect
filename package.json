@@ -34,7 +34,9 @@
     "launch-agent:check": "node scripts/install-launch-agent.mjs check",
     "launch-agent:uninstall": "node scripts/install-launch-agent.mjs uninstall",
     "check:no-token": "node scripts/check-no-token.mjs",
-    "check:redteam": "node scripts/static-redteam.mjs"
+    "check:redteam": "node scripts/static-redteam.mjs",
+    "check:anki-contract": "pnpm --filter @remnoteconnect/shared build && node scripts/check-anki-contract.mjs",
+    "bench:anki-compat": "pnpm build && node scripts/bench-anki-compat.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",

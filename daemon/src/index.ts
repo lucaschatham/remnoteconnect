@@ -6,12 +6,20 @@ import { compactDurableJobs } from "./jobStore.js";
 
 const config = loadConfig();
 await compactDurableJobs(config.appDir);
-const { app } = buildServer(config);
+const { app, ankiApp } = buildServer(config);
 
 try {
   await app.listen({ host: config.host, port: config.port });
+  if (config.ankiCompatEnabled) {
+    await ankiApp.listen({ host: config.ankiCompatHost, port: config.ankiCompatPort });
+  }
   const pluginServer = await startPluginStaticServer(config);
   console.log(`RemNoteConnect daemon listening on http://${config.host}:${config.port}`);
+  console.log(
+    config.ankiCompatEnabled
+      ? `AnkiConnect compatibility listening on http://${config.ankiCompatHost}:${config.ankiCompatPort}`
+      : "AnkiConnect compatibility disabled; set REMNOTE_CONNECT_ANKI_COMPAT=on to enable it.",
+  );
   if (pluginServer) {
     console.log(`Plugin bundle listening on http://${config.pluginHost}:${config.pluginPort}`);
   } else {
