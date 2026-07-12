@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export * from "./ankiConnect.js";
+
 export const PROTOCOL_VERSION = 1;
 export const REMNOTE_CONNECT_VERSION = "0.4.0";
 export const DAEMON_VERSION = REMNOTE_CONNECT_VERSION;

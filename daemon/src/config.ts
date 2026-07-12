@@ -2,7 +2,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT } from "@remnoteconnect/shared";
+import {
+  DEFAULT_ANKI_CONNECT_HOST,
+  DEFAULT_ANKI_CONNECT_PORT,
+  DEFAULT_DAEMON_HOST,
+  DEFAULT_DAEMON_PORT,
+} from "@remnoteconnect/shared";
 
 export type DaemonConfig = {
   host: string;
@@ -17,6 +22,10 @@ export type DaemonConfig = {
   token: string;
   allowedOrigins: string[];
   readonlyMode: boolean;
+  ankiCompatEnabled: boolean;
+  ankiCompatHost: string;
+  ankiCompatPort: number;
+  ankiCompatApiKey?: string;
 };
 
 export function defaultAppDir(): string {
@@ -61,6 +70,11 @@ export function loadConfig(overrides: Partial<DaemonConfig> = {}): DaemonConfig 
   ensureDir(appDir);
   ensureDir(backupDir);
   ensureDir(logDir);
+  const ankiCompatEnabled = overrides.ankiCompatEnabled ?? process.env.REMNOTE_CONNECT_ANKI_COMPAT === "on";
+  const ankiCompatHost = overrides.ankiCompatHost ?? process.env.REMNOTE_CONNECT_ANKI_HOST ?? DEFAULT_ANKI_CONNECT_HOST;
+  if (ankiCompatEnabled && !["127.0.0.1", "localhost", "::1"].includes(ankiCompatHost)) {
+    throw new Error("AnkiConnect compatibility must bind to a loopback host.");
+  }
 
   return {
     host: overrides.host ?? process.env.REMNOTE_CONNECT_HOST ?? DEFAULT_DAEMON_HOST,
@@ -74,6 +88,10 @@ export function loadConfig(overrides: Partial<DaemonConfig> = {}): DaemonConfig 
     tokenFile,
     token: overrides.token ?? process.env.REMNOTE_CONNECT_TOKEN ?? loadOrCreateToken(tokenFile),
     readonlyMode: overrides.readonlyMode ?? process.env.REMNOTE_CONNECT_READONLY_MODE !== "off",
+    ankiCompatEnabled,
+    ankiCompatHost,
+    ankiCompatPort: Number(overrides.ankiCompatPort ?? process.env.REMNOTE_CONNECT_ANKI_PORT ?? DEFAULT_ANKI_CONNECT_PORT),
+    ankiCompatApiKey: overrides.ankiCompatApiKey ?? process.env.REMNOTE_CONNECT_ANKI_API_KEY,
     allowedOrigins: overrides.allowedOrigins ?? [
       "http://localhost:8080",
       "http://127.0.0.1:8080",

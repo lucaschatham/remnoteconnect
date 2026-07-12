@@ -49,6 +49,15 @@ RemNoteConnect can operate on an entire RemNote knowledge base after the desktop
 - Treat snapshot restore as disaster recovery, not true undo. Restored Rem are copies with new IDs.
 - Do not run broad writes on a real graph until the dry-run output makes sense.
 
+## AnkiConnect Compatibility Safety
+
+- Compatibility Mode is off by default and must bind to a loopback host.
+- Set `REMNOTE_CONNECT_ANKI_API_KEY` before using browser extensions or third-party clients.
+- Compatibility writes intentionally follow AnkiConnect's immediate-write contract, so they do not expose the native dry-run handshake to the Anki client.
+- Native read-only mode remains the final write gate. Leave it on except during a deliberate compatibility write window.
+- A successful compatibility response means the supported RemNote or sidecar operation completed. Unsupported scheduler, review-log, GUI, and package actions return errors rather than simulated success.
+- Never expose port 8765 through a tunnel, port forward, reverse proxy, or non-loopback bind.
+
 ## Public Support Safety
 
 Never paste these into public issues, pull requests, chat logs, or screenshots:
