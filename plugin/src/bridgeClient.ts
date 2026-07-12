@@ -215,7 +215,7 @@ export class BridgeClient {
     this.health.activeJobs += 1;
     this.renderHealth();
     try {
-      const result = await executeAction(this.plugin, message.action, message.params ?? {}, (completed, total, progressMessage) => {
+      const result = await executeAction(this.plugin, message.action, message.params ?? {}, (completed, total, progressMessage, checkpoint) => {
         if (this.socket === responseSocket && this.bridgeGeneration === responseGeneration) responseSocket.send(
           JSON.stringify({
             type: "progress",
@@ -224,6 +224,7 @@ export class BridgeClient {
             completed,
             total,
             message: progressMessage,
+            checkpoint,
           }),
         );
       });

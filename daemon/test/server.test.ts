@@ -10,7 +10,7 @@ import { BRIDGE_MAX_PAYLOAD_BYTES } from "../src/bridge.js";
 import { appendJobSnapshot, createDurableJob } from "../src/jobStore.js";
 import { BUILD_HASH, actionMetadata, hasExplicitActionParamSchema } from "@remnoteconnect/shared";
 
-function testBundle(options: { readonlyMode?: boolean } = {}) {
+function testBundle(options: { readonlyMode?: boolean; fastLocalRootId?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "remnote-connect-"));
   const config = loadConfig({
     appDir: join(dir, "app"),
@@ -18,6 +18,7 @@ function testBundle(options: { readonlyMode?: boolean } = {}) {
     tokenFile: join(dir, "app", "token"),
     token: "test-token-test-token",
     readonlyMode: options.readonlyMode ?? false,
+    fastLocalRootId: options.fastLocalRootId,
   });
   const bundle = buildServer(config);
   return { ...bundle, config, dir };
@@ -324,6 +325,7 @@ describe("daemon server", () => {
       createFolder: { path: "blocked" },
       createFlashcards: { cards: [] },
       createFlashcardsAsync: { cards: [] },
+      syncAtlasBatch: { mode: "fast-local", batchId: "readonly", rootId: "atlas-root", namespace: "learning-atlas", sourceRevision: "test", documents: [], flashcards: [] },
       importSnapshot: { snapshot: {} },
       answerCard: { cardId: "blocked", score: 2 },
       addNotes: { notes: [] },
@@ -919,6 +921,136 @@ describe("daemon server", () => {
     });
     expect(materialized.json().result).toMatchObject({ count: 2, remIds: ["async-1", "async-2"] });
     expect(readFileSync(join(bundle.config.appDir, "external-id-index.jsonl"), "utf8")).toContain("ext-b");
+    ws.close();
+    await bundle.app.close();
+  });
+
+  it("runs an Atlas sync as one pinned-root bridge job without putting note content in the journal", async () => {
+    const bundle = testBundle({ fastLocalRootId: "atlas-root" });
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    let bridgeJobs = 0;
+    const { ws, ready } = connectPlugin(port, {
+      onJob(message, socket) {
+        bridgeJobs += 1;
+        expect(message.action).toBe("syncAtlasBatch");
+        expect(message.params.rootId).toBe("atlas-root");
+        socket.send(JSON.stringify({
+          type: "progress",
+          jobId: message.jobId,
+          completed: 1,
+          total: 1,
+          message: "Synced 1/1 Atlas items",
+          checkpoint: [{
+            externalId: "atlas:math",
+            remId: "atlas-rem-1",
+            parentRemId: "atlas-root",
+            contentHash: `sha256:${"a".repeat(64)}`,
+            namespace: "learning-atlas",
+            lastBatchId: "atlas-batch-1",
+            kind: "document",
+          }],
+        }));
+        socket.send(JSON.stringify({
+          type: "result",
+          jobId: message.jobId,
+          result: {
+            batchId: "atlas-batch-1",
+            status: "completed",
+            created: 1,
+            updated: 0,
+            unchanged: 0,
+            errors: [],
+            unresolvedReferences: [],
+            indexEntries: [],
+          },
+          error: null,
+        }));
+      },
+    });
+    await ready;
+
+    const disabled = testBundle();
+    dirs.push(disabled.dir);
+    const blocked = await disabled.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch",
+        version: 1,
+        params: {
+          mode: "fast-local", batchId: "blocked", rootId: "atlas-root", namespace: "learning-atlas", sourceRevision: "test",
+          documents: [], flashcards: [],
+        },
+      },
+    });
+    expect(blocked.json().error.code).toBe("experimental_disabled");
+    await disabled.app.close();
+
+    const wrongRoot = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch", version: 1,
+        params: { mode: "fast-local", batchId: "wrong-root", rootId: "different-root", namespace: "learning-atlas", sourceRevision: "test", documents: [], flashcards: [] },
+      },
+    });
+    expect(wrongRoot.json().error.code).toBe("forbidden_target");
+
+    const malformed = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch", version: 1,
+        params: {
+          mode: "fast-local", batchId: "malformed", rootId: "atlas-root", namespace: "learning-atlas", sourceRevision: "test",
+          documents: [{ externalId: "atlas:math", contentHash: "not-a-hash", markdown: "Mathematics" }], flashcards: [],
+        },
+      },
+    });
+    expect(malformed.json().error.code).toBe("bad_request");
+
+    const cyclic = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch", version: 1,
+        params: {
+          mode: "fast-local", batchId: "cyclic", rootId: "atlas-root", namespace: "learning-atlas", sourceRevision: "test", flashcards: [],
+          documents: [
+            { externalId: "atlas:a", parentExternalId: "atlas:b", contentHash: `sha256:${"a".repeat(64)}`, markdown: "A" },
+            { externalId: "atlas:b", parentExternalId: "atlas:a", contentHash: `sha256:${"b".repeat(64)}`, markdown: "B" },
+          ],
+        },
+      },
+    });
+    expect(cyclic.json().error.code).toBe("forbidden_target");
+
+    const queued = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch",
+        version: 1,
+        params: {
+          mode: "fast-local", batchId: "atlas-batch-1", rootId: "atlas-root", namespace: "learning-atlas", sourceRevision: "test",
+          documents: [{ externalId: "atlas:math", contentHash: `sha256:${"a".repeat(64)}`, markdown: "Mathematics" }],
+          flashcards: [],
+        },
+      },
+    });
+    const jobId = queued.json().result.jobId;
+    const waited = await bundle.app.inject({ method: "POST", url: "/", headers: authHeaders, payload: { action: "jobWait", version: 1, params: { jobId, timeoutMs: 5000 } } });
+    expect(waited.json().result).toMatchObject({ status: "complete", result: { created: 1 }, ids: ["atlas-rem-1"] });
+    expect(bridgeJobs).toBe(1);
+    const journal = readFileSync(join(bundle.config.appDir, "jobs.jsonl"), "utf8");
+    expect(journal).not.toContain("Mathematics");
+    expect(readFileSync(join(bundle.config.appDir, "external-id-index.jsonl"), "utf8")).toContain("atlas:math");
     ws.close();
     await bundle.app.close();
   });

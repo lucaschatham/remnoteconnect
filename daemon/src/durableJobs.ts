@@ -1,8 +1,9 @@
 import type { ApiError, ApiResponse } from "@remnoteconnect/shared";
-import { fail, ok, retryableBridgeError } from "@remnoteconnect/shared";
+import { DEFAULT_DAEMON_HOST, fail, ok, retryableBridgeError } from "@remnoteconnect/shared";
 import type { DaemonConfig } from "./config.js";
 import type { PluginBridge } from "./bridge.js";
-import { appendExternalId, readExternalIdMap } from "./externalIdIndex.js";
+import { appendExternalId, appendExternalIds, readExternalIdIndex, readExternalIdMap } from "./externalIdIndex.js";
+import { readAtlasPayload, removeAtlasPayload, writeAtlasPayload } from "./atlasPayloadStore.js";
 import {
   appendJobSnapshot,
   createDurableJob,
@@ -42,6 +43,95 @@ function externalIdFromItem(pluginAction: "createFlashcard" | "addNote", item: R
 function idFromResult(result: unknown): string | undefined {
   const record = asRecord(result);
   return str(record.id);
+}
+
+function atlasItemCount(params: Record<string, unknown>): number {
+  return (Array.isArray(params.documents) ? params.documents.length : 0) + (Array.isArray(params.flashcards) ? params.flashcards.length : 0);
+}
+
+function atlasSafeParams(params: Record<string, unknown>): Record<string, unknown> {
+  return {
+    mode: params.mode,
+    batchId: params.batchId,
+    rootId: params.rootId,
+    namespace: params.namespace,
+    sourceRevision: params.sourceRevision,
+    reconcile: params.reconcile === true,
+    atlasPayloadStored: true,
+  };
+}
+
+function atlasValidationError(params: Record<string, unknown>, config: DaemonConfig): string | undefined {
+  if (config.host !== DEFAULT_DAEMON_HOST || config.pluginHost !== DEFAULT_DAEMON_HOST) {
+    return "syncAtlasBatch requires the daemon and plugin bridge to bind to 127.0.0.1.";
+  }
+  const rootId = config.fastLocalRootId;
+  if (!rootId) return "syncAtlasBatch is disabled until REMNOTE_CONNECT_FAST_LOCAL_ROOT_ID is configured.";
+  if (params.mode !== "fast-local") return "syncAtlasBatch requires mode:fast-local.";
+  if (params.rootId !== rootId) return "syncAtlasBatch rootId does not match the configured fast-local root.";
+  const documents = Array.isArray(params.documents) ? params.documents.map(asRecord) : [];
+  const flashcards = Array.isArray(params.flashcards) ? params.flashcards.map(asRecord) : [];
+  const kinds = new Map<string, "document" | "flashcard">();
+  for (const [kind, items] of [["document", documents], ["flashcard", flashcards]] as const) {
+    for (const item of items) {
+      const externalId = str(item.externalId);
+      if (!externalId) return "syncAtlasBatch contains an item without externalId.";
+      if (kinds.has(externalId)) return `syncAtlasBatch contains duplicate externalId ${externalId}.`;
+      kinds.set(externalId, kind);
+    }
+  }
+  const documentParents = new Map(documents.map((item) => [str(item.externalId)!, str(item.parentExternalId)]));
+  for (const [externalId, parentExternalId] of documentParents) {
+    const visited = new Set<string>();
+    let current = externalId;
+    while (documentParents.has(current)) {
+      if (visited.has(current)) return `syncAtlasBatch document parents contain a cycle at ${current}.`;
+      visited.add(current);
+      const parent = documentParents.get(current);
+      if (!parent || !documentParents.has(parent)) break;
+      current = parent;
+    }
+    if (parentExternalId && kinds.get(parentExternalId) === "flashcard") return `Document ${externalId} cannot have a flashcard parent.`;
+  }
+  for (const card of flashcards) {
+    const parentExternalId = str(card.parentExternalId);
+    if (parentExternalId && kinds.get(parentExternalId) === "flashcard") return `Flashcard ${str(card.externalId) ?? "<unknown>"} cannot have a flashcard parent.`;
+  }
+  return undefined;
+}
+
+function atlasRelevantExternalIds(params: Record<string, unknown>): Set<string> {
+  const ids = new Set<string>();
+  for (const raw of [...(Array.isArray(params.documents) ? params.documents : []), ...(Array.isArray(params.flashcards) ? params.flashcards : [])]) {
+    const item = asRecord(raw);
+    const externalId = str(item.externalId);
+    const parentExternalId = str(item.parentExternalId);
+    if (externalId) ids.add(externalId);
+    if (parentExternalId) ids.add(parentExternalId);
+    for (const link of Array.isArray(item.links) ? item.links.map(asRecord) : []) {
+      const targetExternalId = str(link.targetExternalId);
+      if (targetExternalId) ids.add(targetExternalId);
+    }
+  }
+  return ids;
+}
+
+function atlasIndexRecords(value: unknown): Array<{ externalId: string; remId: string; parentRemId?: string; contentHash?: string; namespace?: string; lastBatchId?: string; kind?: "document" | "flashcard" }> {
+  if (!Array.isArray(value)) return [];
+  return value.map(asRecord).flatMap((entry) => {
+    const externalId = str(entry.externalId);
+    const remId = str(entry.remId);
+    if (!externalId || !remId) return [];
+    return [{
+      externalId,
+      remId,
+      parentRemId: str(entry.parentRemId),
+      contentHash: str(entry.contentHash),
+      namespace: str(entry.namespace),
+      lastBatchId: str(entry.lastBatchId),
+      kind: entry.kind === "flashcard" ? "flashcard" : entry.kind === "document" ? "document" : undefined,
+    }];
+  });
 }
 
 function publicError(error: unknown): { code: string; message: string; details?: unknown } {
@@ -102,8 +192,22 @@ export class DurableJobManager {
     await this.resumeSafeJobs();
   }
 
-  async submit(action: "createFlashcardsAsync" | "importAsync", params: Record<string, unknown>): Promise<ApiResponse> {
+  async submit(action: DurableJobRecord["action"], params: Record<string, unknown>): Promise<ApiResponse> {
     if (this.isReadonly()) return fail("readonly_mode", `${action} is blocked while read-only mode is enabled.`);
+    if (action === "syncAtlasBatch") {
+      const validationError = atlasValidationError(params, this.config);
+      if (validationError) return fail(this.config.fastLocalRootId ? "forbidden_target" : "experimental_disabled", validationError);
+      const priorUnknown = [...(await readDurableJobs(this.config.appDir)).values()].find(
+        (job) => job.action === "syncAtlasBatch" && job.status === "outcome_unknown" && job.params.batchId === params.batchId,
+      );
+      const payload = priorUnknown ? { ...params, reconcile: true } : params;
+      const job = createDurableJob(action, atlasSafeParams(payload), atlasItemCount(payload));
+      await writeAtlasPayload(this.config.appDir, job.jobId, payload);
+      if (priorUnknown) await removeAtlasPayload(this.config.appDir, priorUnknown.jobId);
+      await this.save(job);
+      void this.kick(job.jobId);
+      return ok(publicJob(job));
+    }
     const total = this.totalFor(action, params);
     if (params.dryRun === true || params.confirm !== true) {
       return ok({
@@ -190,14 +294,18 @@ export class DurableJobManager {
     job.status = "running";
     await this.save(job);
     try {
-      if (job.action === "importAsync" && (str(job.params.markdown) || str(job.params.md))) {
+      let result: Record<string, unknown> | undefined;
+      if (job.action === "syncAtlasBatch") {
+        result = await this.processAtlasBatch(job);
+      } else if (job.action === "importAsync" && (str(job.params.markdown) || str(job.params.md))) {
         await this.processDocument(job);
       } else {
         await this.processFlashcards(job);
       }
       job.status = "complete";
-      job.result = { count: job.ids.length, ids: job.ids, remIds: job.ids };
+      job.result = result ?? { count: job.ids.length, ids: job.ids, remIds: job.ids };
       await this.save(job);
+      if (job.action === "syncAtlasBatch") await removeAtlasPayload(this.config.appDir, job.jobId);
     } catch (error) {
       if (retryableBridgeError(error)) {
         const details = asRecord((error as Partial<ApiError>).details);
@@ -273,7 +381,56 @@ export class DurableJobManager {
     await this.save(job);
   }
 
-  private totalFor(action: "createFlashcardsAsync" | "importAsync", params: Record<string, unknown>): number {
+  private async processAtlasBatch(job: DurableJobRecord): Promise<Record<string, unknown>> {
+    const payload = await readAtlasPayload(this.config.appDir, job.jobId);
+    const validationError = atlasValidationError(payload, this.config);
+    if (validationError) throw { code: this.config.fastLocalRootId ? "forbidden_target" : "experimental_disabled", message: validationError } satisfies ApiError;
+    const relevantExternalIds = atlasRelevantExternalIds(payload);
+    const index = await readExternalIdIndex(this.config.appDir);
+    const pluginParams = {
+      ...payload,
+      index: [...index.entries()]
+        .filter(([externalId]) => relevantExternalIds.has(externalId))
+        .map(([, { ts: _ts, action: _action, ...entry }]) => entry),
+    };
+    const persisted = new Set<string>();
+    let checkpointChain = Promise.resolve();
+    const persistCheckpoint = async (progress: { completed: number; total: number; message?: string; checkpoint?: Array<Record<string, unknown>>; at: number }): Promise<void> => {
+      const entries = atlasIndexRecords(progress.checkpoint);
+      const fresh = entries.filter((entry) => !persisted.has(entry.externalId));
+      for (const entry of fresh) persisted.add(entry.externalId);
+      if (fresh.length > 0) {
+        await appendExternalIds(this.config.appDir, fresh.map((entry) => ({ ...entry, action: "syncAtlasBatch" })));
+        job.ids = [...new Set([...job.ids, ...fresh.map((entry) => entry.remId)])];
+      }
+      job.cursor = progress.completed;
+      job.progress.push({ completed: progress.completed, total: progress.total, message: progress.message, at: progress.at });
+      await this.save(job);
+    };
+    job.activeItemIndex = job.cursor;
+    await this.save(job);
+    const timeoutMs = Math.max(120_000, job.total * 1_000);
+    const result = await this.bridge.runJob("syncAtlasBatch", pluginParams, timeoutMs, {
+      onProgress: (progress) => {
+        checkpointChain = checkpointChain.then(() => persistCheckpoint(progress));
+      },
+    });
+    await checkpointChain;
+    const record = asRecord(result);
+    const finalEntries = atlasIndexRecords(record.indexEntries).filter((entry) => !persisted.has(entry.externalId));
+    if (finalEntries.length > 0) {
+      await appendExternalIds(this.config.appDir, finalEntries.map((entry) => ({ ...entry, action: "syncAtlasBatch" })));
+      job.ids = [...new Set([...job.ids, ...finalEntries.map((entry) => entry.remId)])];
+    }
+    job.cursor = job.total;
+    delete job.activeItemIndex;
+    delete job.activeExternalId;
+    delete job.outcomeUnknownAt;
+    return { ...record, ids: job.ids, remIds: job.ids };
+  }
+
+  private totalFor(action: DurableJobRecord["action"], params: Record<string, unknown>): number {
+    if (action === "syncAtlasBatch") return atlasItemCount(params);
     if (action === "importAsync" && (str(params.markdown) || str(params.md))) return 1;
     return cardsFromParams(params).items.length;
   }

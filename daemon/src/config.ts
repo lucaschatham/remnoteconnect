@@ -26,6 +26,7 @@ export type DaemonConfig = {
   ankiCompatHost: string;
   ankiCompatPort: number;
   ankiCompatApiKey?: string;
+  fastLocalRootId?: string;
 };
 
 export function defaultAppDir(): string {
@@ -92,6 +93,7 @@ export function loadConfig(overrides: Partial<DaemonConfig> = {}): DaemonConfig 
     ankiCompatHost,
     ankiCompatPort: Number(overrides.ankiCompatPort ?? process.env.REMNOTE_CONNECT_ANKI_PORT ?? DEFAULT_ANKI_CONNECT_PORT),
     ankiCompatApiKey: overrides.ankiCompatApiKey ?? process.env.REMNOTE_CONNECT_ANKI_API_KEY,
+    fastLocalRootId: overrides.fastLocalRootId ?? (process.env.REMNOTE_CONNECT_FAST_LOCAL_ROOT_ID?.trim() || undefined),
     allowedOrigins: overrides.allowedOrigins ?? [
       "http://localhost:8080",
       "http://127.0.0.1:8080",

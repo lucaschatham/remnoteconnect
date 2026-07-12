@@ -32,6 +32,7 @@ function usage() {
   rnc get-properties ID --powerup CODE --slot SLOT
   rnc create-flashcards-async --file cards.json --confirm
   rnc import-async --md file.md --confirm
+  rnc sync-atlas --manifest atlas-batch.json --root-id REM_ROOT_ID --fast-local [--wait] [--reconcile]
   rnc delete --query "text:old" [--confirm] [--confirm-count N]
   rnc find-duplicates [--by text]
   rnc find-empty
@@ -370,6 +371,16 @@ async function main() {
     } else {
       usage();
     }
+  } else if (command === "sync-atlas") {
+    const manifest = flags.manifest ?? flags.file;
+    if (!manifest || !flags.rootId || flags.fastLocal !== true) usage();
+    const accepted = await call("syncAtlasBatch", {
+      ...(await readJsonPayload(manifest)),
+      mode: "fast-local",
+      rootId: flags.rootId,
+      reconcile: flags.reconcile === true,
+    });
+    result = flags.wait === true ? await call("jobWait", { jobId: accepted.jobId, timeoutMs: flags.timeoutMs === undefined ? undefined : Number(flags.timeoutMs) }) : accepted;
   } else if (command === "delete") {
     result = await call(flags.query ? "bulkDelete" : "deleteRem", {
       ...commonParams(flags),
