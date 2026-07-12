@@ -1,4 +1,5 @@
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import {
@@ -39,9 +40,30 @@ function safeFilename(value: unknown): string {
   return value;
 }
 
-function wildcard(pattern: string): RegExp {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
-  return new RegExp(`^${escaped}$`);
+function wildcardMatch(pattern: string, value: string): boolean {
+  if (pattern.length > 1_024) throw new Error("media filename pattern exceeds 1024 characters");
+  let patternIndex = 0;
+  let valueIndex = 0;
+  let starIndex = -1;
+  let retryValueIndex = 0;
+  while (valueIndex < value.length) {
+    if (patternIndex < pattern.length && (pattern[patternIndex] === "?" || pattern[patternIndex] === value[valueIndex])) {
+      patternIndex += 1;
+      valueIndex += 1;
+    } else if (patternIndex < pattern.length && pattern[patternIndex] === "*") {
+      starIndex = patternIndex;
+      patternIndex += 1;
+      retryValueIndex = valueIndex;
+    } else if (starIndex >= 0) {
+      patternIndex = starIndex + 1;
+      retryValueIndex += 1;
+      valueIndex = retryValueIndex;
+    } else {
+      return false;
+    }
+  }
+  while (patternIndex < pattern.length && pattern[patternIndex] === "*") patternIndex += 1;
+  return patternIndex === pattern.length;
 }
 
 const DEFAULT_MODEL_CSS = ".card { font-family: arial; font-size: 20px; text-align: center; color: black; background-color: white; }";
@@ -73,12 +95,16 @@ export class AnkiCompatDispatcher {
     this.mediaDir = resolve(join(options.appDir, "anki-media"));
   }
 
-  async dispatch(request: AnkiConnectRequest): Promise<unknown> {
-    const action = ankiConnectActionsByName.get(request.action);
-    if (!action) throw new Error("unsupported action");
+  authorize(request: AnkiConnectRequest): void {
     if (this.options.apiKey && !safeTokenEqual(request.key, this.options.apiKey) && request.action !== "requestPermission") {
       throw new Error("valid api key must be provided");
     }
+  }
+
+  async dispatch(request: AnkiConnectRequest): Promise<unknown> {
+    const action = ankiConnectActionsByName.get(request.action);
+    if (!action) throw new Error("unsupported action");
+    this.authorize(request);
     if (action.status !== "blocked" && action.mutates && this.options.readonlyMode()) {
       throw new Error(`${request.action} is blocked because RemNoteConnect read-only mode is enabled`);
     }
@@ -1026,24 +1052,46 @@ export class AnkiCompatDispatcher {
     if (body.byteLength > 25 * 1024 * 1024) throw new Error("media file exceeds the 25 MiB compatibility limit");
     if (typeof params.skipHash === "string" && createHash("md5").update(body).digest("hex") === params.skipHash) return null;
     await mkdir(this.mediaDir, { recursive: true });
-    await writeFile(join(this.mediaDir, filename), body, { flag: params.deleteExisting === false ? "wx" : "w" });
+    const destination = join(this.mediaDir, filename);
+    if (params.deleteExisting === false) {
+      await writeFile(destination, body, { flag: "wx", mode: 0o600 });
+    } else {
+      const tempPath = join(this.mediaDir, `.${filename}.${process.pid}.${Date.now()}.tmp`);
+      try {
+        await writeFile(tempPath, body, { flag: "wx", mode: 0o600 });
+        await rm(destination, { force: true });
+        await rename(tempPath, destination);
+      } finally {
+        await rm(tempPath, { force: true });
+      }
+    }
     return filename;
   }
 
   private async retrieveMediaFile(params: Record<string, unknown>): Promise<string | false> {
     const filename = safeFilename(params.filename);
+    const path = join(this.mediaDir, filename);
     try {
-      return (await readFile(join(this.mediaDir, filename))).toString("base64");
+      const pathInfo = await lstat(path);
+      if (!pathInfo.isFile() || pathInfo.isSymbolicLink()) throw new Error("media path is not a regular file");
+      const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        if (!(await handle.stat()).isFile()) throw new Error("media path is not a regular file");
+        return (await handle.readFile()).toString("base64");
+      } finally {
+        await handle.close();
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      if ((error as NodeJS.ErrnoException).code === "ELOOP") throw new Error("media path is not a regular file");
       throw error;
     }
   }
 
   private async getMediaFilesNames(params: Record<string, unknown>): Promise<string[]> {
     await mkdir(this.mediaDir, { recursive: true });
-    const matcher = wildcard(String(params.pattern ?? "*"));
-    return (await readdir(this.mediaDir)).filter((name) => matcher.test(name)).sort();
+    const pattern = String(params.pattern ?? "*");
+    return (await readdir(this.mediaDir)).filter((name) => wildcardMatch(pattern, name)).sort();
   }
 
   private async deleteMediaFile(params: Record<string, unknown>): Promise<null> {

@@ -50,6 +50,8 @@ The 51 blocked actions are still recognized and return a deterministic string er
 
 Call the native `capabilities` action for the full machine-readable manifest and each action’s current status. Call AnkiConnect `apiReflect` for the official action-name surface.
 
+See the [parity roadmap](ANKICONNECT_PARITY_ROADMAP.md) for the action-family gap analysis, release gates, and the distinction between authoring compatibility and unavailable Anki scheduler/GUI semantics.
+
 ## Important semantic mappings
 
 - Anki note → practice-enabled Rem

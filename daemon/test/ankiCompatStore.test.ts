@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AnkiCompatStore } from "../src/ankiCompatStore.js";
@@ -41,6 +41,21 @@ describe("AnkiCompatStore", () => {
     const nextId = await fixture.store.getOrCreatePublicId("note", "new-rem");
     expect(nextId).toBeGreaterThan(cardId);
     expect(nextId).not.toBe(noteId);
+  });
+
+  it("persists a large identity batch with unique IDs and owner-only permissions", async () => {
+    const fixture = await store();
+    const externalIds = Array.from({ length: 10_000 }, (_, index) => `rem-${index}`);
+    const ids = await fixture.store.getOrCreatePublicIds("note", externalIds);
+    expect(ids).toHaveLength(externalIds.length);
+    expect(new Set(ids).size).toBe(externalIds.length);
+    expect(ids.every(Number.isSafeInteger)).toBe(true);
+
+    const statePath = join(fixture.dir, "anki-compat-v1.json");
+    if (process.platform !== "win32") expect((await stat(statePath)).mode & 0o777).toBe(0o600);
+
+    const restarted = new AnkiCompatStore(fixture.dir);
+    expect(await restarted.resolveExternalId("note", ids.at(-1)!)).toBe(externalIds.at(-1));
   });
 
   it("fails closed on malformed state without overwriting it", async () => {

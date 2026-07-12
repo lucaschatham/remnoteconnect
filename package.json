@@ -1,7 +1,7 @@
 {
   "name": "remnote-connect",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Local RemNote bridge for CLI, scripts, and LLM agents.",
   "type": "module",
   "packageManager": "pnpm@11.7.0",
@@ -37,6 +37,7 @@
     "check:no-token": "node scripts/check-no-token.mjs",
     "check:redteam": "node scripts/static-redteam.mjs",
     "check:anki-contract": "pnpm --filter @remnoteconnect/shared build && node scripts/check-anki-contract.mjs",
+    "check:anki-smoke": "pnpm build && node scripts/smoke-anki-listener.mjs",
     "bench:anki-compat": "pnpm build && node scripts/bench-anki-compat.mjs"
   },
   "devDependencies": {

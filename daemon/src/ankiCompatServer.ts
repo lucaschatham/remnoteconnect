@@ -15,6 +15,9 @@ type ServerOptions = {
   dispatcher: AnkiCompatDispatcher;
 };
 
+const MAX_MULTI_DEPTH = 8;
+const MAX_MULTI_ACTIONS = 1_000;
+
 function allowedHost(host: string | undefined, _config: DaemonConfig): boolean {
   if (!host) return false;
   const hostname = host.startsWith("[") ? host.slice(1, host.indexOf("]")) : host.split(":")[0];
@@ -65,16 +68,28 @@ export function buildAnkiCompatServer({ config, dispatcher }: ServerOptions): Fa
       .send(formatAnkiConnectError(candidate.message ?? String(error)));
   });
 
-  const handle = async (input: unknown): Promise<unknown> => {
+  const handle = async (
+    input: unknown,
+    context: { depth: number; budget: { remaining: number } } = {
+      depth: 0,
+      budget: { remaining: MAX_MULTI_ACTIONS },
+    },
+  ): Promise<unknown> => {
     const parsed = AnkiConnectRequestSchema.safeParse(input);
     if (!parsed.success) return formatAnkiConnectError(parsed.error.message);
     const request = parsed.data;
     try {
+      dispatcher.authorize(request as AnkiConnectRequest);
       if (request.action === "multi") {
         if (!Array.isArray(request.params.actions)) throw new Error("multi requires actions");
         const actions = request.params.actions;
+        if (context.depth >= MAX_MULTI_DEPTH) throw new Error(`multi nesting exceeds ${MAX_MULTI_DEPTH} levels`);
+        if (actions.length > context.budget.remaining) throw new Error(`multi action budget exceeds ${MAX_MULTI_ACTIONS}`);
+        context.budget.remaining -= actions.length;
         const nested = [];
-        for (const action of actions) nested.push(await handle(action));
+        for (const action of actions) {
+          nested.push(await handle(action, { depth: context.depth + 1, budget: context.budget }));
+        }
         return formatAnkiConnectSuccess(request.version, nested);
       }
       const result = await dispatcher.dispatch(request as AnkiConnectRequest);

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -158,6 +158,58 @@ describe("AnkiConnect compatibility contract", () => {
     await app.close();
   });
 
+  it("authenticates the outer multi request and bounds nested work", async () => {
+    const { app } = await fixture({ apiKey: "secret" });
+    const headers = { host: "127.0.0.1:8765" };
+
+    const deniedEmptyBatch = await app.inject({
+      method: "POST",
+      url: "/",
+      headers,
+      payload: { action: "multi", version: 6, params: { actions: [] } },
+    });
+    expect(deniedEmptyBatch.json()).toEqual({ result: null, error: "valid api key must be provided" });
+
+    const authenticatedBatch = await app.inject({
+      method: "POST",
+      url: "/",
+      headers,
+      payload: {
+        action: "multi",
+        version: 6,
+        key: "secret",
+        params: { actions: [{ action: "version", version: 6, key: "secret" }] },
+      },
+    });
+    expect(authenticatedBatch.json()).toEqual({
+      result: [{ result: 6, error: null }],
+      error: null,
+    });
+
+    let nested: Record<string, unknown> = { action: "version", version: 6, key: "secret" };
+    for (let depth = 0; depth < 10; depth += 1) {
+      nested = { action: "multi", version: 6, key: "secret", params: { actions: [nested] } };
+    }
+    const excessiveDepth = await app.inject({ method: "POST", url: "/", headers, payload: nested });
+    expect(JSON.stringify(excessiveDepth.json())).toContain("multi nesting exceeds");
+
+    const excessiveWidth = await app.inject({
+      method: "POST",
+      url: "/",
+      headers,
+      payload: {
+        action: "multi",
+        version: 6,
+        key: "secret",
+        params: {
+          actions: Array.from({ length: 1_001 }, () => ({ action: "version", version: 6, key: "secret" })),
+        },
+      },
+    });
+    expect(excessiveWidth.json().error).toContain("multi action budget exceeds");
+    await app.close();
+  });
+
   it("enforces the optional API key and reports request permission", async () => {
     const { app } = await fixture({ apiKey: "secret" });
     const denied = await app.inject({
@@ -187,7 +239,7 @@ describe("AnkiConnect compatibility contract", () => {
   });
 
   it("locks the compatibility surface to loopback origins and bounded media paths", async () => {
-    const { app } = await fixture();
+    const { app, dir } = await fixture();
     const deniedHost = await app.inject({
       method: "POST",
       url: "/",
@@ -220,14 +272,44 @@ describe("AnkiConnect compatibility contract", () => {
     });
     expect(localUrl.json().error).toContain("must use http or https");
 
-    const dir = await mkdtemp(join(tmpdir(), "rnc-anki-non-loopback-"));
-    dirs.push(dir);
+    if (process.platform !== "win32") {
+      const mediaDir = join(dir, "anki-media");
+      const outsideFile = join(dir, "outside-secret.txt");
+      await mkdir(mediaDir, { recursive: true });
+      await writeFile(outsideFile, "do-not-read-or-overwrite");
+      await symlink(outsideFile, join(mediaDir, "linked.txt"));
+
+      const linkedRead = await app.inject({
+        method: "POST",
+        url: "/",
+        headers: { host: "127.0.0.1:8765" },
+        payload: { action: "retrieveMediaFile", version: 6, params: { filename: "linked.txt" } },
+      });
+      expect(linkedRead.json().error).toContain("regular file");
+
+      const linkedReplace = await app.inject({
+        method: "POST",
+        url: "/",
+        headers: { host: "127.0.0.1:8765" },
+        payload: {
+          action: "storeMediaFile",
+          version: 6,
+          params: { filename: "linked.txt", data: Buffer.from("safe-media").toString("base64") },
+        },
+      });
+      expect(linkedReplace.json().result).toBe("linked.txt");
+      expect(await readFile(outsideFile, "utf8")).toBe("do-not-read-or-overwrite");
+      expect(await readFile(join(mediaDir, "linked.txt"), "utf8")).toBe("safe-media");
+    }
+
+    const nonLoopbackDir = await mkdtemp(join(tmpdir(), "rnc-anki-non-loopback-"));
+    dirs.push(nonLoopbackDir);
     expect(() =>
       loadConfig({
-        appDir: dir,
-        backupDir: join(dir, "backups"),
-        logDir: join(dir, "logs"),
-        tokenFile: join(dir, "token"),
+        appDir: nonLoopbackDir,
+        backupDir: join(nonLoopbackDir, "backups"),
+        logDir: join(nonLoopbackDir, "logs"),
+        tokenFile: join(nonLoopbackDir, "token"),
         token: "test-token-test-token",
         ankiCompatEnabled: true,
         ankiCompatHost: "0.0.0.0",
@@ -298,6 +380,10 @@ describe("AnkiConnect compatibility contract", () => {
     expect(stored.json().result).toBe("tone.mp3");
     const retrieved = await app.inject({ method: "POST", url: "/", headers, payload: { action: "retrieveMediaFile", version: 6, params: { filename: "tone.mp3" } } });
     expect(Buffer.from(retrieved.json().result, "base64").toString()).toBe("audio");
+    const mediaNames = await app.inject({ method: "POST", url: "/", headers, payload: { action: "getMediaFilesNames", version: 6, params: { pattern: "t?ne.*" } } });
+    expect(mediaNames.json().result).toEqual(["tone.mp3"]);
+    const excessivePattern = await app.inject({ method: "POST", url: "/", headers, payload: { action: "getMediaFilesNames", version: 6, params: { pattern: "*".repeat(1_025) } } });
+    expect(excessivePattern.json().error).toContain("pattern exceeds");
 
     const skipped = await app.inject({ method: "POST", url: "/", headers, payload: { action: "storeMediaFile", version: 6, params: { filename: "hello.txt", data: Buffer.from("hello").toString("base64"), skipHash: "5d41402abc4b2a76b9719d911017c592" } } });
     expect(skipped.json()).toEqual({ result: null, error: null });
