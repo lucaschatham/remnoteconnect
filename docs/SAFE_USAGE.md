@@ -45,9 +45,22 @@ RemNoteConnect can operate on an entire RemNote knowledge base after the desktop
 - Treat `emptyTrash` as irreversible.
 - `emptyTrash` counts every descendant, not only the visible tombstone folder.
 - An `outcome_unknown` durable job requires reconciliation; do not resubmit it blindly.
-- Scheduler mutation and structural merge are disabled in v0.4.
+- For `sync-atlas`, pin `REMNOTE_CONNECT_FAST_LOCAL_ROOT_ID` to one dedicated root and pass the same value through `--root-id`. The fast path never permits cross-root writes, moves, merges, or deletes.
+- Atlas sync is experimental and not daemon-undoable. Run the preview first, back up the dedicated root, then pass `--confirm` and the exact `--confirm-count` when required.
+- Keep personal notes and cards unmarked beneath the synced skill Rems. Atlas sync updates only Rems with its own metadata; clone a generated card before making personal edits you want to preserve.
+- Use `node scripts/rnc.mjs sync-atlas --manifest FILE --root-id ROOT --fast-local --reconcile` after an Atlas job reports `outcome_unknown`.
+- Scheduler mutation and structural merge are disabled in v0.5.
 - Treat snapshot restore as disaster recovery, not true undo. Restored Rem are copies with new IDs.
 - Do not run broad writes on a real graph until the dry-run output makes sense.
+
+## AnkiConnect Compatibility Safety
+
+- Compatibility Mode is off by default and must bind to a loopback host.
+- Set `REMNOTE_CONNECT_ANKI_API_KEY` before using browser extensions or third-party clients.
+- Compatibility writes intentionally follow AnkiConnect's immediate-write contract, so they do not expose the native dry-run handshake to the Anki client.
+- Native read-only mode remains the final write gate. Leave it on except during a deliberate compatibility write window.
+- A successful compatibility response means the supported RemNote or sidecar operation completed. Unsupported scheduler, review-log, GUI, and package actions return errors rather than simulated success.
+- Never expose port 8765 through a tunnel, port forward, reverse proxy, or non-loopback bind.
 
 ## Public Support Safety
 

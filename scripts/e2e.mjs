@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { hardDeleteTestIds } from "./live-helpers.mjs";
+import { disposableTag } from "./live-fixture-names.mjs";
 
 const tokenPath =
   process.env.REMNOTE_CONNECT_TOKEN_FILE ??
@@ -65,7 +66,7 @@ try {
     deckPath: runId,
     front,
     back,
-    tags: ["rnc-e2e"],
+    tags: [disposableTag("rnc-e2e", runId)],
     batchId: runId,
   });
 

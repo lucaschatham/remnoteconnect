@@ -11,21 +11,25 @@ permissions:
 
 jobs:
   verify:
-    name: Verify public repo
-    runs-on: ubuntu-latest
+    name: Verify public repo (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     env:
       CI: "true"
     steps:
       - name: Check out repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
         with:
           version: 11.7.0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "22"
           cache: pnpm
@@ -59,6 +63,7 @@ jobs:
           done
 
       - name: Package script integrity
+        shell: bash
         run: |
           node - <<'NODE'
           const fs = require("fs");
@@ -96,8 +101,24 @@ jobs:
       - name: Build
         run: pnpm -r build
 
+      - name: AnkiConnect contract
+        run: pnpm check:anki-contract
+
+      - name: AnkiConnect listener smoke
+        run: pnpm check:anki-smoke
+
       - name: Token scan
         run: pnpm check:no-token
 
       - name: Static red-team checks
         run: pnpm check:redteam
+
+  required:
+    name: Verify public repo
+    if: ${{ always() }}
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform verification
+        if: ${{ needs.verify.result != 'success' }}
+        run: exit 1

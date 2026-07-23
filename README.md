@@ -65,12 +65,29 @@ Because the CLI is plain shell, it can be used by Codex, Claude Code, Cursor age
 flowchart LR
   CLI["CLI / scripts / LLM agent"] --> Daemon["Local daemon\n127.0.0.1:8766"]
   Daemon --> Bridge["WebSocket bridge"]
-  Bridge --> Plugin["RemNote plugin iframe\n127.0.0.1:8080"]
+  Bridge --> Plugin["RemNote plugin iframe\nlocalhost:8081"]
   Plugin --> SDK["RemNote Plugin SDK"]
   SDK --> KB["Your RemNote knowledge base"]
 ```
 
 RemNote does not expose a general backend API for this use case, so writes happen through a RemNote frontend plugin. The local daemon handles auth, request validation, safety gates, job state, backups, and CLI/API ergonomics.
+
+### Fast Local Atlas Sync (experimental)
+
+`sync-atlas` is the high-throughput path for a personal Learning Atlas. The full source graph remains in local JSON, Obsidian, or a webpage; RemNote receives only the branch currently being studied. It sends one durable job over the existing local WebSocket rather than one request per Rem.
+
+1. Create a disposable or deliberately dedicated RemNote root for the active Atlas branch.
+2. Set `REMNOTE_CONNECT_FAST_LOCAL_ROOT_ID` before starting the daemon.
+3. Sync a manifest containing stable `externalId` and `sha256:<hash>` values:
+
+```sh
+node scripts/rnc.mjs sync-atlas \
+  --manifest ./atlas-batch.json \
+  --root-id REM_ROOT_ID \
+  --fast-local --confirm --confirm-count EXACT_ITEM_COUNT --wait
+```
+
+The daemon rejects a missing or mismatched root, remote modes, duplicate IDs, parent cycles, card parents, and any move/delete/merge operation. The first invocation returns a preview. Execution requires `--confirm`, plus `--confirm-count` above 50 items. The batch only creates or updates Rems marked with RemNoteConnect Atlas metadata; personal children, evidence, and unmarked cards are never adopted or removed. Atlas sync is not daemon-undoable, so use a dedicated backed-up root. Re-run the same manifest with `--reconcile` only after an `outcome_unknown` result.
 
 ## Safety Model
 
@@ -97,7 +114,7 @@ Requirements:
 
 - macOS
 - RemNote desktop
-- Node.js
+- Node.js 22 or 24 LTS
 - `pnpm`
 
 Install:
@@ -118,16 +135,19 @@ npx pnpm@11.7.0 --filter @remnoteconnect/daemon start
 The daemon serves the plugin bundle at:
 
 ```text
-http://127.0.0.1:8080
+http://localhost:8081
 ```
 
 In RemNote desktop:
 
 1. Open Plugins.
-2. Go to Build.
-3. Choose “Develop from localhost”.
-4. Enter `http://127.0.0.1:8080`.
-5. Approve the requested permissions.
+2. Disable any older marketplace copy of RemNoteConnect in Manage.
+3. Go to Build.
+4. Choose “Develop from localhost”.
+5. Enter `http://localhost:8081`.
+6. Approve the requested permissions.
+
+The local build uses its own plugin ID. This prevents an installed marketplace copy from blocking local development and keeps future local upgrades on one stable identity.
 
 Generate a short-lived pairing code:
 
@@ -135,7 +155,7 @@ Generate a short-lived pairing code:
 node scripts/rnc.mjs pair
 ```
 
-Paste that pairing code into the plugin's daemon token setting. The plugin exchanges it locally and stores the real token in plugin-local storage; the token is never embedded in the public bundle. Direct token entry remains a recovery path.
+In RemNote, open the Omnibar and run **RemNoteConnect: Pair with local daemon**. Paste the code into the pairing popup. The plugin exchanges it locally and stores the real token in plugin-local storage; the token is never embedded in the public bundle. Direct token entry in plugin settings remains a recovery path when that RemNote build exposes registered settings.
 
 Then verify:
 
@@ -169,7 +189,7 @@ RemNoteConnect exposes a native action API:
 }
 ```
 
-It also includes an AnkiConnect-inspired adapter for familiar workflows:
+It also includes an AnkiConnect-inspired adapter on the native API for familiar workflows:
 
 - `addNote`
 - `addNotes`
@@ -180,7 +200,15 @@ It also includes an AnkiConnect-inspired adapter for familiar workflows:
 - `createDeck`
 - `changeDeck`
 
-This is workflow parity, not literal Anki compatibility. Anki-specific model, template, scheduler, and `.apkg` actions return stable unsupported errors.
+For existing AnkiConnect clients, an independent compatibility listener can be enabled on `127.0.0.1:8765`. It recognizes all 122 actions in the pinned AnkiConnect v6 contract and currently implements 71 through native translation or a local compatibility sidecar. Scheduler/review-log, Anki desktop GUI, and APKG behavior fail explicitly because RemNote exposes no faithful equivalent.
+
+```sh
+REMNOTE_CONNECT_ANKI_COMPAT=on \
+REMNOTE_CONNECT_ANKI_API_KEY='choose-a-local-secret' \
+npx pnpm@11.7.0 --filter @remnoteconnect/daemon start
+```
+
+Compatibility Mode is off by default and remains subject to native read-only mode. See [docs/ANKICONNECT_COMPATIBILITY.md](docs/ANKICONNECT_COMPATIBILITY.md) for the action status, mappings, safety rules, and setup.
 
 ## Core Actions
 
@@ -216,7 +244,7 @@ See [docs/LEARNING_WORKFLOWS.md](docs/LEARNING_WORKFLOWS.md) for practical patte
 
 ## Maturity
 
-Stable in v0.4:
+Stable in v0.5:
 
 - local daemon and RemNote plugin bridge
 - CLI and HTTP action envelope
@@ -225,15 +253,18 @@ Stable in v0.4:
 - exact recursive hard-delete plans and single-use approval nonces
 - durable-job outcome-unknown handling across disconnects and restarts
 - local token pairing and token-free plugin builds
+- Omnibar pairing popup that does not depend on RemNote's plugin settings UI
+- clean-source release builds carrying a Git-derived daemon/plugin identity
 - basic document, flashcard, search, map, and cleanup workflows
 
-Disabled or experimental in v0.4:
+Disabled or experimental in v0.5:
 
 - image occlusion and advanced media workflows
 - scheduler mutation and generated-card deletion are disabled until complete scheduling state can be restored
 - structural merge is disabled until reference inversion is live-verified
+- pinned-root fast local Atlas sync remains opt-in until large disposable-root benchmarks pass
 - semantic search sidecars
-- RemNote marketplace packaging
+- RemNote listing review and broad distribution. Validated unlisted-plugin packaging is supported.
 - cross-platform packaging beyond local Mac usage
 
 ## Verification
@@ -244,7 +275,7 @@ Static checks:
 npx pnpm@11.7.0 -r typecheck
 npx pnpm@11.7.0 --filter @remnoteconnect/plugin test
 npx pnpm@11.7.0 --filter @remnoteconnect/daemon test
-npx pnpm@11.7.0 -r build
+npx pnpm@11.7.0 build
 npx pnpm@11.7.0 check:no-token
 npx pnpm@11.7.0 check:redteam
 ```

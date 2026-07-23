@@ -1,20 +1,26 @@
 {
   "name": "remnote-connect",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Local RemNote bridge for CLI, scripts, and LLM agents.",
   "type": "module",
   "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
-    "build": "pnpm -r build",
+    "build": "node scripts/build-release.mjs",
+    "build:packages": "pnpm -r build",
+    "package:remnote": "node scripts/package-remnote-plugin.mjs",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm --filter @remnoteconnect/plugin test && pnpm --filter @remnoteconnect/daemon test",
+    "test": "pnpm --filter @remnoteconnect/plugin test && pnpm --filter @remnoteconnect/daemon test && node --test scripts/local-diagnostics.test.mjs scripts/build-release.test.mjs scripts/install-utils.test.mjs scripts/live-fixture-names.test.mjs scripts/package-remnote-plugin.test.mjs",
     "dev:daemon": "pnpm --filter @remnoteconnect/daemon dev",
     "dev:plugin": "pnpm --filter @remnoteconnect/plugin dev",
     "token:unsafe": "pnpm --filter @remnoteconnect/daemon token:unsafe",
     "smoke": "node scripts/smoke.mjs",
     "e2e": "node scripts/e2e.mjs",
     "bench": "node scripts/bench.mjs",
+    "bench:atlas": "node scripts/bench-atlas-sync.mjs",
     "live:restore": "node scripts/live-restore.mjs",
     "live:security": "node scripts/live-security.mjs",
     "live:scope": "node scripts/live-scope.mjs",
@@ -28,13 +34,17 @@
     "live:idempotent": "node scripts/live-idempotent.mjs",
     "live:scheduler": "node scripts/scheduler-smoke.mjs",
     "live:jobs": "node scripts/job-retention.mjs",
+    "recent-reviews": "node scripts/recent-reviews.mjs",
     "chaos:daemon": "node scripts/chaos-daemon.mjs",
     "chaos:async": "node scripts/chaos-async-job.mjs",
     "launch-agent:install": "node scripts/install-launch-agent.mjs install",
     "launch-agent:check": "node scripts/install-launch-agent.mjs check",
     "launch-agent:uninstall": "node scripts/install-launch-agent.mjs uninstall",
     "check:no-token": "node scripts/check-no-token.mjs",
-    "check:redteam": "node scripts/static-redteam.mjs"
+    "check:redteam": "node scripts/static-redteam.mjs",
+    "check:anki-contract": "pnpm --filter @remnoteconnect/shared build && node scripts/check-anki-contract.mjs",
+    "check:anki-smoke": "pnpm build && node scripts/smoke-anki-listener.mjs",
+    "bench:anki-compat": "pnpm build && node scripts/bench-anki-compat.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",

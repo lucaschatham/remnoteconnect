@@ -13,6 +13,8 @@ import {
   isPluginAction,
   nativeActions,
   adapterActions,
+  ankiConnectActionManifest,
+  ANKI_CONNECT_SOURCE_COMMIT,
   ok,
   plannedActions,
   pluginActions,
@@ -35,9 +37,13 @@ import { appendExternalId, readExternalIdMap } from "./externalIdIndex.js";
 import { DurableJobManager } from "./durableJobs.js";
 import { IRREVERSIBLE_SESSION_BUDGET, MAGNITUDE_THRESHOLD, SafetyCoordinator } from "./safety.js";
 import { PairingStore } from "./pairing.js";
+import { AnkiCompatStore } from "./ankiCompatStore.js";
+import { AnkiCompatDispatcher } from "./ankiCompatDispatcher.js";
+import { buildAnkiCompatServer } from "./ankiCompatServer.js";
 
 export type ServerBundle = {
   app: FastifyInstance;
+  ankiApp: FastifyInstance;
   bridge: PluginBridge;
 };
 
@@ -223,6 +229,14 @@ async function dispatchAction(
     return ok({
       native: nativeActions,
       adapter: adapterActions,
+      ankiConnect: {
+        enabled: config.ankiCompatEnabled,
+        host: config.ankiCompatHost,
+        port: config.ankiCompatPort,
+        apiKeyRequired: Boolean(config.ankiCompatApiKey),
+        sourceCommit: ANKI_CONNECT_SOURCE_COMMIT,
+        actions: ankiConnectActionManifest,
+      },
       unsupported: unsupportedAnkiActions,
       planned: plannedActions,
       plugin: pluginActions,
@@ -386,7 +400,7 @@ async function dispatchAction(
     if (!jobId) return fail("bad_request", "jobWait requires jobId.");
     return durableJobs.wait(jobId, Number(params.timeoutMs ?? 120_000));
   }
-  if (action === "createFlashcardsAsync" || action === "importAsync") {
+  if (action === "createFlashcardsAsync" || action === "importAsync" || action === "syncAtlasBatch") {
     return durableJobs.submit(action, params);
   }
   if (action === "confirmMaterialized") {
@@ -781,6 +795,15 @@ export function buildServer(config: DaemonConfig): ServerBundle {
   const durableJobs = new DurableJobManager(config, bridge, () => state.readonlyMode);
   void durableJobs.start();
   const wss = bridge.createWebSocketServer();
+  const ankiStore = new AnkiCompatStore(config.appDir);
+  const ankiDispatcher = new AnkiCompatDispatcher({
+    appDir: config.appDir,
+    apiKey: config.ankiCompatApiKey,
+    readonlyMode: () => state.readonlyMode,
+    store: ankiStore,
+    dispatchNative: (action, params) => dispatchAction(action, params, bridge, durableJobs, config, state, 0, undefined, true),
+  });
+  const ankiApp = buildAnkiCompatServer({ config, dispatcher: ankiDispatcher });
 
   app.server.on("upgrade", (request, socket, head) => {
     if (request.url !== "/bridge" || !isAllowedHost(request.headers.host, config)) {
@@ -864,5 +887,5 @@ export function buildServer(config: DaemonConfig): ServerBundle {
     }
   });
 
-  return { app, bridge };
+  return { app, ankiApp, bridge };
 }

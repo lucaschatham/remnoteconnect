@@ -4,6 +4,9 @@ import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize, relative } from "node:path";
 import type { DaemonConfig } from "./config.js";
 
+export const LOCAL_PLUGIN_ID = "remnoteconnect-local-dev";
+export const LOCAL_PLUGIN_NAME = "RemNoteConnect (Local Development)";
+
 const CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -24,6 +27,17 @@ function safePath(root: string, urlPath: string): string | undefined {
   return absolute;
 }
 
+export function localPluginManifest(manifest: unknown): Record<string, unknown> {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new Error("Plugin manifest must be a JSON object.");
+  }
+  return {
+    ...(manifest as Record<string, unknown>),
+    id: LOCAL_PLUGIN_ID,
+    name: LOCAL_PLUGIN_NAME,
+  };
+}
+
 export async function startPluginStaticServer(config: DaemonConfig): Promise<Server | undefined> {
   if (!existsSync(config.pluginDistDir)) return undefined;
   const server = createServer(async (request, response) => {
@@ -35,7 +49,11 @@ export async function startPluginStaticServer(config: DaemonConfig): Promise<Ser
     try {
       const info = await stat(file);
       const path = info.isDirectory() ? join(file, "index.html") : file;
-      const body = await readFile(path);
+      const fileBody = await readFile(path);
+      const body =
+        relative(config.pluginDistDir, path) === "manifest.json"
+          ? `${JSON.stringify(localPluginManifest(JSON.parse(fileBody.toString("utf8"))), null, 2)}\n`
+          : fileBody;
       response.writeHead(200, {
         "Content-Type": CONTENT_TYPES[extname(path)] ?? "application/octet-stream",
         "Cache-Control": "no-store",

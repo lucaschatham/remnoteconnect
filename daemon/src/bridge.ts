@@ -22,7 +22,8 @@ type PendingJob = {
   timeout: NodeJS.Timeout;
   resolve: (value: unknown) => void;
   reject: (error: ApiError) => void;
-  progress: Array<{ completed: number; total: number; message?: string; at: number }>;
+  progress: Array<{ completed: number; total: number; message?: string; checkpoint?: Array<Record<string, unknown>>; at: number }>;
+  onProgress?: (progress: PendingJob["progress"][number]) => void;
   bridgeGeneration: number;
   socket: WebSocket;
 };
@@ -61,10 +62,11 @@ export type BridgeStatus = {
 const MAX_JOB_HISTORY = 500;
 const JOB_HISTORY_TTL_MS = 30 * 60 * 1000;
 const HEARTBEAT_INTERVAL_MS = 12_000;
-export const BRIDGE_MAX_PAYLOAD_BYTES = 512 * 1024 * 1024;
+export const BRIDGE_MAX_PAYLOAD_BYTES = 128 * 1024 * 1024;
 
 type RunJobOptions = {
   signal?: AbortSignal;
+  onProgress?: (progress: PendingJob["progress"][number]) => void;
 };
 
 export class PluginBridge {
@@ -186,6 +188,7 @@ export class PluginBridge {
         bridgeGeneration: generation,
         socket,
       };
+      pendingJob.onProgress = options.onProgress;
       this.pending.set(jobId, pendingJob);
       this.setJob(jobId, { status: "pending", action, progress: pendingJob.progress, updatedAt: Date.now() });
       options.signal?.addEventListener(
@@ -284,16 +287,20 @@ export class PluginBridge {
         completed?: number;
         total?: number;
         message?: string;
+        checkpoint?: Array<Record<string, unknown>>;
       };
       if (progress.type === "progress" && progress.jobId) {
         const job = this.pending.get(progress.jobId);
         if (!job || job.socket !== ws || job.bridgeGeneration !== connectionGeneration || (progress.bridgeGeneration ?? connectionGeneration) !== connectionGeneration) return;
-        job.progress.push({
+        const entry = {
           completed: Number(progress.completed ?? 0),
           total: Number(progress.total ?? 0),
           message: progress.message,
+          checkpoint: Array.isArray(progress.checkpoint) ? progress.checkpoint : undefined,
           at: Date.now(),
-        });
+        };
+        job.progress.push(entry);
+        job.onProgress?.(entry);
         return;
       }
     });

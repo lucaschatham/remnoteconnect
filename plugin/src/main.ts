@@ -1,19 +1,18 @@
 import { declareIndexPlugin } from "@remnote/plugin-sdk";
 import type { ReactRNPlugin } from "@remnote/plugin-sdk";
-import { BridgeClient } from "./bridgeClient.js";
+import { activatePlugin, deactivatePlugin } from "./lifecycle.js";
+import { renderPairWidget } from "./pairWidget.js";
+import { selectWidgetRoute } from "./widgetRoute.js";
 
-let client: BridgeClient | undefined;
-
-declareIndexPlugin(
-  async (plugin: ReactRNPlugin) => {
-    client = new BridgeClient(plugin);
-    await client.registerSettings();
-    await client.start();
-    void plugin.app.waitForInitialSync().catch(() => undefined);
-    await plugin.app.toast("RemNoteConnect plugin loaded.");
-  },
-  async () => {
-    client?.stop();
-    client = undefined;
-  },
-);
+if (selectWidgetRoute(window.location.search) === "pair") {
+  renderPairWidget();
+} else {
+  declareIndexPlugin(
+    async (plugin: ReactRNPlugin) => {
+      await activatePlugin(plugin);
+    },
+    async () => {
+      deactivatePlugin();
+    },
+  );
+}

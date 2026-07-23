@@ -7,7 +7,7 @@ export type DurableJobStatus = "queued" | "running" | "outcome_unknown" | "pause
 export type DurableJobRecord = {
   schemaVersion: 1;
   jobId: string;
-  action: "createFlashcardsAsync" | "importAsync";
+  action: "createFlashcardsAsync" | "importAsync" | "syncAtlasBatch";
   status: DurableJobStatus;
   createdAt: string;
   updatedAt: string;
@@ -25,6 +25,15 @@ export type DurableJobRecord = {
 
 export function jobStorePath(appDir: string): string {
   return join(appDir, "jobs.jsonl");
+}
+
+export function isUnsupportedDirectorySyncError(
+  error: unknown,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform !== "win32") return false;
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EPERM" || code === "EINVAL" || code === "ENOTSUP";
 }
 
 export function createDurableJob(action: DurableJobRecord["action"], params: Record<string, unknown>, total: number): DurableJobRecord {
@@ -45,7 +54,7 @@ export function createDurableJob(action: DurableJobRecord["action"], params: Rec
 }
 
 function compactFinishedParams(params: Record<string, unknown>): Record<string, unknown> {
-  const keep = ["batchId", "deckPath", "deckName", "parentPath", "externalId"];
+  const keep = ["batchId", "deckPath", "deckName", "parentPath", "externalId", "rootId", "namespace", "sourceRevision", "reconcile", "atlasPayloadStored"];
   const compact: Record<string, unknown> = {};
   for (const key of keep) {
     if (params[key] !== undefined) compact[key] = params[key];
@@ -154,7 +163,11 @@ export async function compactDurableJobs(appDir: string): Promise<{ jobs: number
   await rename(tmp, file);
   const directory = await open(appDir, "r");
   try {
-    await directory.sync();
+    try {
+      await directory.sync();
+    } catch (error) {
+      if (!isUnsupportedDirectorySyncError(error)) throw error;
+    }
   } finally {
     await directory.close();
   }

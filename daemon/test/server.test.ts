@@ -8,16 +8,18 @@ import { loadConfig } from "../src/config.js";
 import { startPluginStaticServer } from "../src/pluginStatic.js";
 import { BRIDGE_MAX_PAYLOAD_BYTES } from "../src/bridge.js";
 import { appendJobSnapshot, createDurableJob } from "../src/jobStore.js";
-import { BUILD_HASH, actionMetadata, hasExplicitActionParamSchema } from "@remnoteconnect/shared";
+import { ATLAS_MAX_ITEMS, BUILD_HASH, actionMetadata, hasExplicitActionParamSchema } from "@remnoteconnect/shared";
 
-function testBundle(options: { readonlyMode?: boolean } = {}) {
+function testBundle(options: { readonlyMode?: boolean; fastLocalRootId?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "remnote-connect-"));
   const config = loadConfig({
     appDir: join(dir, "app"),
     backupDir: join(dir, "backups"),
+    logDir: join(dir, "logs"),
     tokenFile: join(dir, "app", "token"),
     token: "test-token-test-token",
     readonlyMode: options.readonlyMode ?? false,
+    fastLocalRootId: options.fastLocalRootId,
   });
   const bundle = buildServer(config);
   return { ...bundle, config, dir };
@@ -37,7 +39,7 @@ function connectPlugin(
   handlers: { onJob?: (message: { jobId: string; action: string; params: Record<string, unknown> }, ws: WebSocket) => void; pluginBuildHash?: string } = {},
 ) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`, {
-    headers: { origin: "http://127.0.0.1:8080" },
+    headers: { origin: "http://127.0.0.1:8081" },
   });
   const ready = new Promise<void>((resolve, reject) => {
     ws.once("open", () => {
@@ -150,7 +152,11 @@ describe("daemon server", () => {
     const dist = join(bundle.dir, "plugin-dist");
     mkdirSync(dist, { recursive: true });
     writeFileSync(join(dist, "index.html"), "<!doctype html><title>RemNoteConnect</title>", "utf8");
-    writeFileSync(join(dist, "manifest.json"), "{\"name\":\"RemNoteConnect\"}", "utf8");
+    writeFileSync(
+      join(dist, "manifest.json"),
+      JSON.stringify({ id: "remnoteconnect-local-v3", name: "RemNoteConnect", version: { major: 0, minor: 5, patch: 0 } }),
+      "utf8",
+    );
 
     const server = await startPluginStaticServer({ ...bundle.config, pluginPort: 0, pluginDistDir: dist });
     expect(server).toBeTruthy();
@@ -159,7 +165,15 @@ describe("daemon server", () => {
     const html = await fetch(`http://127.0.0.1:${address.port}/`).then((response) => response.text());
     expect(html).toContain("RemNoteConnect");
     const manifest = await fetch(`http://127.0.0.1:${address.port}/manifest.json`).then((response) => response.json());
-    expect(manifest.name).toBe("RemNoteConnect");
+    expect(manifest).toMatchObject({
+      id: "remnoteconnect-local-dev",
+      name: "RemNoteConnect (Local Development)",
+      version: { major: 0, minor: 5, patch: 0 },
+    });
+    expect(JSON.parse(readFileSync(join(dist, "manifest.json"), "utf8"))).toMatchObject({
+      id: "remnoteconnect-local-v3",
+      name: "RemNoteConnect",
+    });
     await new Promise<void>((resolve, reject) => server?.close((error) => (error ? reject(error) : resolve())));
   });
 
@@ -208,10 +222,10 @@ describe("daemon server", () => {
     const response = await bundle.app.inject({
       method: "OPTIONS",
       url: "/",
-      headers: { host: "127.0.0.1:8766", origin: "http://127.0.0.1:8080" },
+      headers: { host: "127.0.0.1:8766", origin: "http://127.0.0.1:8081" },
     });
     expect(response.statusCode).toBe(204);
-    expect(response.headers["access-control-allow-origin"]).toBe("http://127.0.0.1:8080");
+    expect(response.headers["access-control-allow-origin"]).toBe("http://127.0.0.1:8081");
     expect(response.headers["access-control-allow-headers"]).toContain("Authorization");
   });
 
@@ -324,6 +338,7 @@ describe("daemon server", () => {
       createFolder: { path: "blocked" },
       createFlashcards: { cards: [] },
       createFlashcardsAsync: { cards: [] },
+      syncAtlasBatch: { mode: "fast-local", batchId: "readonly", rootId: "atlas-root", namespace: "learning-atlas", sourceRevision: "test", documents: [], flashcards: [] },
       importSnapshot: { snapshot: {} },
       answerCard: { cardId: "blocked", score: 2 },
       addNotes: { notes: [] },
@@ -438,8 +453,9 @@ describe("daemon server", () => {
     expect(response.json().error.code).toBe("plugin_disconnected");
   });
 
-  it("sets the local bridge payload limit above the ws default for graph backups", () => {
+  it("bounds the local bridge payload while leaving room for large graph backups", () => {
     expect(BRIDGE_MAX_PAYLOAD_BYTES).toBeGreaterThan(100 * 1024 * 1024);
+    expect(BRIDGE_MAX_PAYLOAD_BYTES).toBeLessThanOrEqual(128 * 1024 * 1024);
   });
 
   it("passes backupGraph timeoutMs through the bridge and writes a snapshot", async () => {
@@ -548,7 +564,7 @@ describe("daemon server", () => {
       payload: { action: "pair", version: 1, params: {} },
     });
     const code = issued.json().result.code;
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`, { headers: { origin: "http://127.0.0.1:8080" } });
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`, { headers: { origin: "http://127.0.0.1:8081" } });
     const pairedToken = await new Promise<string>((resolve, reject) => {
       ws.once("open", () => {
         ws.send(JSON.stringify({ type: "hello", token: code, transport: "websocket" }));
@@ -590,7 +606,7 @@ describe("daemon server", () => {
     expect(JSON.stringify(rotated.json())).not.toContain(storedToken);
     expect(storedToken).toMatch(/^[0-9a-f]{64}$/);
     expect(readFileSync(bundle.config.tokenFile, "utf8").trim()).toBe(storedToken);
-    expect(statSync(bundle.config.tokenFile).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") expect(statSync(bundle.config.tokenFile).mode & 0o777).toBe(0o600);
 
     const oldToken = await bundle.app.inject({
       method: "POST",
@@ -637,7 +653,7 @@ describe("daemon server", () => {
     await expect(
       closeCode(
         new WebSocket(`ws://127.0.0.1:${port}/bridge`, {
-          headers: { origin: "http://127.0.0.1:8080" },
+          headers: { origin: "http://127.0.0.1:8081" },
         }),
         JSON.stringify({ type: "hello", token: "wrong-token-wrong-token", transport: "websocket" }),
       ),
@@ -646,7 +662,7 @@ describe("daemon server", () => {
     await expect(
       closeCode(
         new WebSocket(`ws://127.0.0.1:${port}/bridge`, {
-          headers: { origin: "http://127.0.0.1:8080" },
+          headers: { origin: "http://127.0.0.1:8081" },
         }),
         "not json",
       ),
@@ -920,6 +936,230 @@ describe("daemon server", () => {
     expect(materialized.json().result).toMatchObject({ count: 2, remIds: ["async-1", "async-2"] });
     expect(readFileSync(join(bundle.config.appDir, "external-id-index.jsonl"), "utf8")).toContain("ext-b");
     ws.close();
+    await bundle.app.close();
+  });
+
+  it("runs an Atlas sync as one pinned-root bridge job without putting note content in the journal", async () => {
+    const bundle = testBundle({ fastLocalRootId: "atlas-root" });
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    let bridgeJobs = 0;
+    const { ws, ready } = connectPlugin(port, {
+      onJob(message, socket) {
+        bridgeJobs += 1;
+        expect(message.action).toBe("syncAtlasBatch");
+        expect(message.params.rootId).toBe("atlas-root");
+        socket.send(JSON.stringify({
+          type: "progress",
+          jobId: message.jobId,
+          completed: 1,
+          total: 1,
+          message: "Synced 1/1 Atlas items",
+          checkpoint: [{
+            externalId: "atlas:math",
+            remId: "atlas-rem-1",
+            parentRemId: "atlas-root",
+            contentHash: `sha256:${"a".repeat(64)}`,
+            namespace: "learning-atlas",
+            lastBatchId: "atlas-batch-1",
+            kind: "document",
+          }],
+        }));
+        socket.send(JSON.stringify({
+          type: "result",
+          jobId: message.jobId,
+          result: {
+            batchId: "atlas-batch-1",
+            status: "completed",
+            created: 1,
+            updated: 0,
+            unchanged: 0,
+            errors: [],
+            unresolvedReferences: [],
+            indexEntries: [],
+          },
+          error: null,
+        }));
+      },
+    });
+    await ready;
+
+    const disabled = testBundle();
+    dirs.push(disabled.dir);
+    const blocked = await disabled.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch",
+        version: 1,
+        params: {
+          mode: "fast-local", batchId: "blocked", rootId: "atlas-root", namespace: "learning-atlas", sourceRevision: "test",
+          documents: [], flashcards: [],
+        },
+      },
+    });
+    expect(blocked.json().error.code).toBe("experimental_disabled");
+    await disabled.app.close();
+
+    const wrongRoot = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch", version: 1,
+        params: { mode: "fast-local", batchId: "wrong-root", rootId: "different-root", namespace: "learning-atlas", sourceRevision: "test", documents: [], flashcards: [] },
+      },
+    });
+    expect(wrongRoot.json().error.code).toBe("forbidden_target");
+
+    const malformed = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch", version: 1,
+        params: {
+          mode: "fast-local", batchId: "malformed", rootId: "atlas-root", namespace: "learning-atlas", sourceRevision: "test",
+          documents: [{ externalId: "atlas:math", contentHash: "not-a-hash", markdown: "Mathematics" }], flashcards: [],
+        },
+      },
+    });
+    expect(malformed.json().error.code).toBe("bad_request");
+
+    const cyclic = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch", version: 1,
+        params: {
+          mode: "fast-local", batchId: "cyclic", rootId: "atlas-root", namespace: "learning-atlas", sourceRevision: "test", flashcards: [],
+          documents: [
+            { externalId: "atlas:a", parentExternalId: "atlas:b", contentHash: `sha256:${"a".repeat(64)}`, markdown: "A" },
+            { externalId: "atlas:b", parentExternalId: "atlas:a", contentHash: `sha256:${"b".repeat(64)}`, markdown: "B" },
+          ],
+        },
+      },
+    });
+    expect(cyclic.json().error.code).toBe("forbidden_target");
+
+    const preview = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch",
+        version: 1,
+        params: {
+          mode: "fast-local",
+          batchId: "atlas-batch-preview",
+          rootId: "atlas-root",
+          namespace: "learning-atlas",
+          sourceRevision: "test",
+          documents: [{ externalId: "atlas:preview", contentHash: `sha256:${"a".repeat(64)}`, markdown: "Preview" }],
+          flashcards: [],
+        },
+      },
+    });
+    expect(preview.json().result).toMatchObject({ dryRun: true, action: "syncAtlasBatch", count: 1 });
+    expect(bridgeJobs).toBe(0);
+
+    const magnitude = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch",
+        version: 1,
+        params: {
+          mode: "fast-local",
+          batchId: "atlas-batch-magnitude",
+          rootId: "atlas-root",
+          namespace: "learning-atlas",
+          sourceRevision: "test",
+          confirm: true,
+          documents: Array.from({ length: 51 }, (_, index) => ({
+            externalId: `atlas:magnitude:${index}`,
+            contentHash: `sha256:${"a".repeat(64)}`,
+            markdown: `Item ${index}`,
+          })),
+          flashcards: [],
+        },
+      },
+    });
+    expect(magnitude.json().error.code).toBe("magnitude_guard");
+
+    const queued = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch",
+        version: 1,
+        params: {
+          mode: "fast-local", batchId: "atlas-batch-1", rootId: "atlas-root", namespace: "learning-atlas", sourceRevision: "test",
+          documents: [{ externalId: "atlas:math", contentHash: `sha256:${"a".repeat(64)}`, markdown: "Mathematics" }],
+          flashcards: [],
+          confirm: true,
+          confirmCount: 1,
+        },
+      },
+    });
+    const jobId = queued.json().result.jobId;
+    const waited = await bundle.app.inject({ method: "POST", url: "/", headers: authHeaders, payload: { action: "jobWait", version: 1, params: { jobId, timeoutMs: 5000 } } });
+    expect(waited.json().result).toMatchObject({ status: "complete", result: { created: 1 }, ids: ["atlas-rem-1"] });
+    expect(bridgeJobs).toBe(1);
+    const journal = readFileSync(join(bundle.config.appDir, "jobs.jsonl"), "utf8");
+    expect(journal).not.toContain("Mathematics");
+    const audit = readFileSync(join(bundle.config.logDir, "audit.jsonl"), "utf8");
+    expect(audit).toContain('"action":"syncAtlasBatch"');
+    expect(audit).toContain('"status":"prepared"');
+    expect(audit).toContain('"status":"success"');
+    expect(audit).not.toContain("Mathematics");
+    expect(readFileSync(join(bundle.config.appDir, "external-id-index.jsonl"), "utf8")).toContain("atlas:math");
+    ws.close();
+    await bundle.app.close();
+  });
+
+  it("describes Atlas sync as experimental and not daemon-undoable", () => {
+    expect(actionMetadata.syncAtlasBatch).toMatchObject({
+      mutates: true,
+      reversible: false,
+      irreversible: false,
+      magnitudeGuarded: true,
+    });
+    expect(actionMetadata.syncAtlasBatch.summary).toMatch(/experimental/i);
+  });
+
+  it("rejects an Atlas request above the active-subset item limit before dispatch", async () => {
+    const bundle = testBundle({ fastLocalRootId: "atlas-root" });
+    dirs.push(bundle.dir);
+    const documents = Array.from({ length: ATLAS_MAX_ITEMS + 1 }, (_, index) => ({
+      externalId: `atlas:limit:${index}`,
+      contentHash: `sha256:${"a".repeat(64)}`,
+      markdown: "bounded",
+    }));
+    const response = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: {
+        action: "syncAtlasBatch",
+        version: 1,
+        params: {
+          mode: "fast-local",
+          batchId: "over-limit",
+          rootId: "atlas-root",
+          namespace: "learning-atlas",
+          sourceRevision: "test",
+          documents,
+          flashcards: [],
+        },
+      },
+    });
+    expect(response.json().error.code).toBe("bad_request");
+    expect(response.json().error.message).toMatch(/parameter/i);
     await bundle.app.close();
   });
 
@@ -1229,7 +1469,7 @@ describe("daemon server", () => {
 
     const undoPath = join(bundle.config.appDir, "undo", `${preparedOpId}.json`);
     expect(existsSync(undoPath)).toBe(true);
-    expect(statSync(undoPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") expect(statSync(undoPath).mode & 0o777).toBe(0o600);
     expect(readFileSync(undoPath, "utf8")).toContain("secret note body");
 
     const auditPath = join(bundle.config.logDir, "audit.jsonl");
@@ -1589,6 +1829,103 @@ describe("daemon server", () => {
     expect(dryRun.json().error.code).toBe("experimental_disabled");
     expect(seen.map((item) => item.action)).toEqual(["mergeRems", "prepareMutation", "mergeRems"]);
     ws.close();
+    await bundle.app.close();
+  });
+
+  it("routes AnkiConnect requests through native safety and the live plugin bridge", async () => {
+    const bundle = testBundle({ readonlyMode: true });
+    dirs.push(bundle.dir);
+    const port = await listen(bundle);
+    const seenActions: string[] = [];
+    const { ws, ready } = connectPlugin(port, {
+      onJob(message, socket) {
+        seenActions.push(message.action);
+        const result =
+          message.action === "addNote"
+            ? {
+                id: "rem-note-1",
+                path: "Default",
+                cards: [{ id: "rem-card-1", remId: "rem-note-1" }],
+              }
+            : message.action === "notesInfo"
+              ? [
+                  {
+                    id: "rem-note-1",
+                    text: "Question",
+                    backText: "Answer",
+                    path: "Default",
+                    tags: [{ text: "integration" }],
+                    cards: [{ id: "rem-card-1", remId: "rem-note-1" }],
+                    updatedAt: 1_700_000_000_000,
+                  },
+                ]
+              : null;
+        socket.send(JSON.stringify({ type: "result", jobId: message.jobId, result, error: null }));
+      },
+    });
+    await ready;
+
+    const blocked = await bundle.ankiApp.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "127.0.0.1:8765" },
+      payload: {
+        action: "addNote",
+        version: 6,
+        params: { note: { deckName: "Default", modelName: "Basic", fields: { Front: "Question", Back: "Answer" } } },
+      },
+    });
+    expect(blocked.json().error).toContain("read-only mode");
+    expect(seenActions).toEqual([]);
+
+    const writeWindow = await bundle.app.inject({
+      method: "POST",
+      url: "/",
+      headers: authHeaders,
+      payload: { action: "readonly", version: 1, params: { mode: "off" } },
+    });
+    expect(writeWindow.json().result.readonlyMode).toBe(false);
+
+    const created = await bundle.ankiApp.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "127.0.0.1:8765" },
+      payload: {
+        action: "addNote",
+        version: 6,
+        params: {
+          note: {
+            deckName: "Default",
+            modelName: "Basic",
+            fields: { Front: "Question", Back: "Answer" },
+            tags: ["integration"],
+          },
+        },
+      },
+    });
+    const noteId = created.json().result;
+    expect(Number.isSafeInteger(noteId)).toBe(true);
+
+    const info = await bundle.ankiApp.inject({
+      method: "POST",
+      url: "/",
+      headers: { host: "127.0.0.1:8765" },
+      payload: { action: "notesInfo", version: 6, params: { notes: [noteId] } },
+    });
+    expect(info.json().result[0]).toMatchObject({
+      noteId,
+      modelName: "Basic",
+      tags: ["integration"],
+      fields: {
+        Front: { value: "Question", order: 0 },
+        Back: { value: "Answer", order: 1 },
+      },
+    });
+    expect(Number.isSafeInteger(info.json().result[0].cards[0])).toBe(true);
+    expect(seenActions).toEqual(["addNote", "notesInfo"]);
+
+    ws.close();
+    await bundle.ankiApp.close();
     await bundle.app.close();
   });
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { assert, call, cleanupByText, requireBridge } from "./live-helpers.mjs";
+import { disposableTag } from "./live-fixture-names.mjs";
 
 const runId = `__rnc_scheduler__-${Date.now().toString(36)}`;
 
@@ -10,7 +11,7 @@ try {
     front: `Scheduler front ${runId}`,
     back: `Scheduler back ${runId}`,
     batchId: runId,
-    tags: ["rnc-scheduler"],
+    tags: [disposableTag("rnc-scheduler", runId)],
     waitForCards: true,
     verbose: true,
   });
