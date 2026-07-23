@@ -36,11 +36,15 @@ export function npxCommand(platform = process.platform, configured = process.env
   return configured || (platform === "win32" ? "npx.cmd" : "npx");
 }
 
+export function releaseBuildSpawnOptions(root, platform = process.platform) {
+  return { cwd: root, stdio: "inherit", shell: platform === "win32" };
+}
+
 function runBuild(root) {
   const result = spawnSync(
     npxCommand(),
     ["--yes", "pnpm@11.7.0", "-r", "--filter", "@remnoteconnect/shared", "--filter", "@remnoteconnect/daemon", "--filter", "@remnoteconnect/plugin", "build"],
-    { cwd: root, stdio: "inherit" },
+    releaseBuildSpawnOptions(root),
   );
   if (result.status !== 0) {
     if (result.error) throw result.error;
