@@ -63,6 +63,7 @@ jobs:
           done
 
       - name: Package script integrity
+        shell: bash
         run: |
           node - <<'NODE'
           const fs = require("fs");
