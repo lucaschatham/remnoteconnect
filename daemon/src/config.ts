@@ -17,6 +17,7 @@ export type DaemonConfig = {
   token: string;
   allowedOrigins: string[];
   readonlyMode: boolean;
+  fastLocalRootId?: string;
 };
 
 export function defaultAppDir(): string {
@@ -66,7 +67,7 @@ export function loadConfig(overrides: Partial<DaemonConfig> = {}): DaemonConfig 
     host: overrides.host ?? process.env.REMNOTE_CONNECT_HOST ?? DEFAULT_DAEMON_HOST,
     port: Number(overrides.port ?? process.env.REMNOTE_CONNECT_PORT ?? DEFAULT_DAEMON_PORT),
     pluginHost: overrides.pluginHost ?? process.env.REMNOTE_CONNECT_PLUGIN_HOST ?? DEFAULT_DAEMON_HOST,
-    pluginPort: Number(overrides.pluginPort ?? process.env.REMNOTE_CONNECT_PLUGIN_PORT ?? 8080),
+    pluginPort: Number(overrides.pluginPort ?? process.env.REMNOTE_CONNECT_PLUGIN_PORT ?? 8081),
     pluginDistDir: overrides.pluginDistDir ?? process.env.REMNOTE_CONNECT_PLUGIN_DIST ?? defaultPluginDistDir(),
     appDir,
     backupDir,
@@ -74,9 +75,10 @@ export function loadConfig(overrides: Partial<DaemonConfig> = {}): DaemonConfig 
     tokenFile,
     token: overrides.token ?? process.env.REMNOTE_CONNECT_TOKEN ?? loadOrCreateToken(tokenFile),
     readonlyMode: overrides.readonlyMode ?? process.env.REMNOTE_CONNECT_READONLY_MODE !== "off",
+    fastLocalRootId: overrides.fastLocalRootId ?? (process.env.REMNOTE_CONNECT_FAST_LOCAL_ROOT_ID?.trim() || undefined),
     allowedOrigins: overrides.allowedOrigins ?? [
-      "http://localhost:8080",
-      "http://127.0.0.1:8080",
+      "http://localhost:8081",
+      "http://127.0.0.1:8081",
       "http://localhost:5173",
       "http://127.0.0.1:5173",
       "app://remnote",

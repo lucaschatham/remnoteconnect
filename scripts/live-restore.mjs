@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { hardDeleteTestIds } from "./live-helpers.mjs";
+import { disposableTag } from "./live-fixture-names.mjs";
 
 const tokenPath =
   process.env.REMNOTE_CONNECT_TOKEN_FILE ??
@@ -41,7 +42,13 @@ try {
 
   const front = `Restore front ${runId}`;
   const back = `Restore back ${runId}`;
-  const created = await call("createFlashcard", { deckPath: runId, front, back, batchId: runId, tags: ["rnc-restore"] });
+  const created = await call("createFlashcard", {
+    deckPath: runId,
+    front,
+    back,
+    batchId: runId,
+    tags: [disposableTag("rnc-restore", runId)],
+  });
 
   const snapshot = await call("exportSubtree", { id: created.id });
   assert(snapshot.nodeCount === 1, "exportSubtree did not snapshot one Rem.");

@@ -1,5 +1,15 @@
 import type { ReactRNPlugin, RichTextInterface } from "@remnote/plugin-sdk";
-import { MANAGED_ROOT_NAME, parseQuery, pluginActions, type CreateFlashcardParams } from "@remnoteconnect/shared";
+import {
+  ATLAS_METADATA_POWERUP_CODE,
+  ATLAS_SYNC_CHUNK_SIZE,
+  MANAGED_ROOT_NAME,
+  parseQuery,
+  pluginActions,
+  type AtlasFlashcard,
+  type AtlasDocument,
+  type AtlasIndexEntry,
+  type CreateFlashcardParams,
+} from "@remnoteconnect/shared";
 import type { RemObject } from "./sdkTypes.js";
 import { PluginActionError } from "./errors.js";
 import {
@@ -1268,7 +1278,257 @@ async function createFlashcards(plugin: ReactRNPlugin, params: Record<string, un
   return params.verbose === true ? { count: created.length, created } : { count: created.length, ids, remIds: ids };
 }
 
-type ProgressFn = (completed: number, total: number, message?: string) => void;
+const ATLAS_METADATA_SLOT = "atlasSync";
+
+type AtlasManagedMetadata = {
+  externalId: string;
+  contentHash: string;
+  namespace: string;
+  batchId: string;
+  parentRemId?: string;
+  kind: "document" | "flashcard";
+};
+
+type AtlasIndexedRem = AtlasIndexEntry & { kind: "document" | "flashcard" };
+
+function atlasItems(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.map(asRecord) : [];
+}
+
+function atlasIndex(value: unknown): Map<string, AtlasIndexedRem> {
+  const map = new Map<string, AtlasIndexedRem>();
+  for (const raw of atlasItems(value)) {
+    const externalId = str(raw.externalId);
+    const remId = str(raw.remId);
+    const kind = raw.kind === "flashcard" ? "flashcard" : raw.kind === "document" ? "document" : undefined;
+    if (externalId && remId && kind) map.set(externalId, { ...raw, externalId, remId, kind } as AtlasIndexedRem);
+  }
+  return map;
+}
+
+async function atlasMetadata(plugin: ReactRNPlugin, rem: RemObject): Promise<AtlasManagedMetadata | undefined> {
+  const rich = await rem.getPowerupPropertyAsRichText(ATLAS_METADATA_POWERUP_CODE, ATLAS_METADATA_SLOT);
+  const value = await richTextToString(plugin, rich);
+  try {
+    const parsed = JSON.parse(value) as Partial<AtlasManagedMetadata>;
+    if (
+      typeof parsed.externalId === "string" &&
+      typeof parsed.contentHash === "string" &&
+      typeof parsed.namespace === "string" &&
+      typeof parsed.batchId === "string" &&
+      (parsed.kind === "document" || parsed.kind === "flashcard")
+    ) return parsed as AtlasManagedMetadata;
+  } catch {
+    // Unmanaged Rems must never be adopted by a batch sync.
+  }
+  return undefined;
+}
+
+async function setAtlasMetadata(plugin: ReactRNPlugin, rem: RemObject, metadata: AtlasManagedMetadata): Promise<void> {
+  await rem.addPowerup(ATLAS_METADATA_POWERUP_CODE);
+  await rem.setPowerupProperty(ATLAS_METADATA_POWERUP_CODE, ATLAS_METADATA_SLOT, await toRichText(plugin, JSON.stringify(metadata)));
+}
+
+async function isUnderAtlasRoot(plugin: ReactRNPlugin, rem: RemObject, root: RemObject): Promise<boolean> {
+  let current: RemObject | undefined = rem;
+  const seen = new Set<string>();
+  while (current && !seen.has(current._id)) {
+    if (current._id === root._id) return true;
+    seen.add(current._id);
+    current = current.parent ? await plugin.rem.findOne(current.parent) ?? undefined : undefined;
+  }
+  return false;
+}
+
+async function reconcileAtlasIndex(plugin: ReactRNPlugin, root: RemObject, namespace: string): Promise<Map<string, AtlasIndexedRem>> {
+  const map = new Map<string, AtlasIndexedRem>();
+  for (const rem of [root, ...(await root.getDescendants())]) {
+    const metadata = await atlasMetadata(plugin, rem);
+    if (!metadata || metadata.namespace !== namespace) continue;
+    map.set(metadata.externalId, {
+      externalId: metadata.externalId,
+      remId: rem._id,
+      parentRemId: metadata.parentRemId,
+      contentHash: metadata.contentHash,
+      namespace: metadata.namespace,
+      lastBatchId: metadata.batchId,
+      kind: metadata.kind,
+    });
+  }
+  return map;
+}
+
+function atlasDocument(raw: Record<string, unknown>): AtlasDocument {
+  return {
+    externalId: String(raw.externalId),
+    contentHash: String(raw.contentHash),
+    parentExternalId: str(raw.parentExternalId),
+    markdown: String(raw.markdown ?? ""),
+    links: Array.isArray(raw.links)
+      ? raw.links.map(asRecord).map((link) => ({ token: String(link.token ?? ""), targetExternalId: String(link.targetExternalId ?? ""), field: link.field === "back" ? "back" : "text" }))
+      : undefined,
+  };
+}
+
+function atlasFlashcard(raw: Record<string, unknown>): AtlasFlashcard {
+  return {
+    externalId: String(raw.externalId),
+    contentHash: String(raw.contentHash),
+    parentExternalId: str(raw.parentExternalId),
+    front: String(raw.front ?? ""),
+    back: String(raw.back ?? ""),
+    tags: stringArray(raw.tags),
+    practiceDirection: raw.practiceDirection === "backward" || raw.practiceDirection === "both" || raw.practiceDirection === "none" ? raw.practiceDirection : "forward",
+  };
+}
+
+async function syncAtlasBatch(plugin: ReactRNPlugin, params: Record<string, unknown>, progress?: ProgressFn): Promise<Record<string, unknown>> {
+  if (params.mode !== "fast-local") throw new PluginActionError("forbidden_target", "syncAtlasBatch only accepts mode:fast-local.");
+  const rootId = str(params.rootId);
+  const batchId = str(params.batchId);
+  const namespace = str(params.namespace) ?? "learning-atlas";
+  if (!rootId || !batchId) throw new PluginActionError("bad_request", "syncAtlasBatch requires rootId and batchId.");
+  const root = await plugin.rem.findOne(rootId);
+  if (!root) throw new PluginActionError("forbidden_target", "Configured fast-local root is not accessible in RemNote.");
+
+  const documents = atlasItems(params.documents).map(atlasDocument);
+  const flashcards = atlasItems(params.flashcards).map(atlasFlashcard);
+  const externalIds = new Set<string>();
+  for (const item of [...documents, ...flashcards]) {
+    if (!item.externalId || !item.contentHash || externalIds.has(item.externalId)) {
+      throw new PluginActionError("bad_request", `Atlas batch has a missing or duplicate externalId: ${item.externalId || "<empty>"}.`);
+    }
+    externalIds.add(item.externalId);
+  }
+
+  const indexed = atlasIndex(params.index);
+  if (params.reconcile === true) {
+    const reconciled = await reconcileAtlasIndex(plugin, root, namespace);
+    for (const [externalId, entry] of reconciled) indexed.set(externalId, entry);
+  }
+  const remByExternalId = new Map<string, RemObject>();
+  for (const [externalId, entry] of indexed) {
+    const rem = await plugin.rem.findOne(entry.remId);
+    if (!rem) continue;
+    if (!(await isUnderAtlasRoot(plugin, rem, root))) throw new PluginActionError("forbidden_target", `Indexed Atlas item ${externalId} is outside the configured root.`);
+    const metadata = await atlasMetadata(plugin, rem);
+    if (!metadata || metadata.externalId !== externalId || metadata.namespace !== namespace || metadata.kind !== entry.kind) {
+      throw new PluginActionError("forbidden_target", `Indexed Atlas item ${externalId} is not a matching managed Rem.`);
+    }
+    remByExternalId.set(externalId, rem);
+  }
+
+  const total = documents.length + flashcards.length;
+  let completed = 0;
+  let created = 0;
+  let updated = 0;
+  let unchanged = 0;
+  const indexEntries: AtlasIndexedRem[] = [];
+  const changedSinceCheckpoint: AtlasIndexedRem[] = [];
+  const checkpoint = async (message: string): Promise<void> => {
+    if (changedSinceCheckpoint.length > 0 || completed === total) {
+      progress?.(completed, total, message, changedSinceCheckpoint.splice(0));
+      await yieldToEventLoop();
+    }
+  };
+  const processDocument = async (item: AtlasDocument): Promise<void> => {
+    const parent = item.parentExternalId ? remByExternalId.get(item.parentExternalId) : root;
+    if (!parent) throw new PluginActionError("bad_request", `Document ${item.externalId} has an unresolved parentExternalId.`);
+    const entry = indexed.get(item.externalId);
+    if (entry && entry.kind !== "document") throw new PluginActionError("bad_request", `Atlas ID ${item.externalId} changes item kind.`);
+    const existing = entry ? remByExternalId.get(item.externalId) : undefined;
+    if (existing && entry?.contentHash === item.contentHash && entry.parentRemId === parent._id) {
+      unchanged += 1;
+      completed += 1;
+      return;
+    }
+    const rem = existing ?? (await plugin.rem.createRem());
+    if (!rem) throw new Error("RemNote did not return a Rem from createRem.");
+    if (existing && existing.parent !== parent._id) throw new PluginActionError("forbidden_target", `Atlas sync refuses to move ${item.externalId}.`);
+    if (!existing) await rem.setParent(parent);
+    await rem.setText(await toRichText(plugin, { markdown: item.markdown }));
+    await setAtlasMetadata(plugin, rem, { externalId: item.externalId, contentHash: item.contentHash, namespace, batchId, parentRemId: parent._id, kind: "document" });
+    const next = { externalId: item.externalId, remId: rem._id, parentRemId: parent._id, contentHash: item.contentHash, namespace, lastBatchId: batchId, kind: "document" as const };
+    indexed.set(item.externalId, next);
+    remByExternalId.set(item.externalId, rem);
+    indexEntries.push(next);
+    changedSinceCheckpoint.push(next);
+    existing ? updated += 1 : created += 1;
+    completed += 1;
+  };
+  const pending = new Map(documents.map((item) => [item.externalId, item]));
+  while (pending.size > 0) {
+    let advanced = false;
+    for (const item of [...pending.values()]) {
+      if (item.parentExternalId && pending.has(item.parentExternalId)) continue;
+      await processDocument(item);
+      pending.delete(item.externalId);
+      advanced = true;
+      if (completed % ATLAS_SYNC_CHUNK_SIZE === 0) await checkpoint(`Synced ${completed}/${total} Atlas items`);
+    }
+    if (!advanced) throw new PluginActionError("bad_request", "Atlas document parents contain a cycle.");
+  }
+  for (const item of flashcards) {
+    const parent = item.parentExternalId ? remByExternalId.get(item.parentExternalId) : root;
+    if (!parent) throw new PluginActionError("bad_request", `Flashcard ${item.externalId} has an unresolved parentExternalId.`);
+    const parentEntry = item.parentExternalId ? indexed.get(item.parentExternalId) : undefined;
+    if (parentEntry?.kind === "flashcard") throw new PluginActionError("bad_request", `Flashcard ${item.externalId} cannot have a flashcard parent.`);
+    const entry = indexed.get(item.externalId);
+    if (entry && entry.kind !== "flashcard") throw new PluginActionError("bad_request", `Atlas ID ${item.externalId} changes item kind.`);
+    const existing = entry ? remByExternalId.get(item.externalId) : undefined;
+    if (existing && entry?.contentHash === item.contentHash && entry.parentRemId === parent._id) {
+      unchanged += 1;
+      completed += 1;
+    } else {
+      const rem = existing ?? (await plugin.rem.createRem());
+      if (!rem) throw new Error("RemNote did not return a Rem from createRem.");
+      if (existing && existing.parent !== parent._id) throw new PluginActionError("forbidden_target", `Atlas sync refuses to move ${item.externalId}.`);
+      if (!existing) await rem.setParent(parent);
+      await rem.setText(await toRichText(plugin, item.front));
+      await rem.setBackText(await toRichText(plugin, item.back));
+      await rem.setEnablePractice(true);
+      await rem.setPracticeDirection(item.practiceDirection ?? "forward");
+      await addTags(plugin, rem, item.tags ?? []);
+      await setAtlasMetadata(plugin, rem, { externalId: item.externalId, contentHash: item.contentHash, namespace, batchId, parentRemId: parent._id, kind: "flashcard" });
+      const next = { externalId: item.externalId, remId: rem._id, parentRemId: parent._id, contentHash: item.contentHash, namespace, lastBatchId: batchId, kind: "flashcard" as const };
+      indexed.set(item.externalId, next);
+      remByExternalId.set(item.externalId, rem);
+      indexEntries.push(next);
+      changedSinceCheckpoint.push(next);
+      existing ? updated += 1 : created += 1;
+      completed += 1;
+    }
+    if (completed % ATLAS_SYNC_CHUNK_SIZE === 0) await checkpoint(`Synced ${completed}/${total} Atlas items`);
+  }
+
+  const unresolvedReferences: Array<{ externalId: string; token: string; targetExternalId: string }> = [];
+  for (const item of documents) {
+    const source = remByExternalId.get(item.externalId);
+    if (!source) continue;
+    for (const link of item.links ?? []) {
+      const target = remByExternalId.get(link.targetExternalId);
+      if (!target) {
+        unresolvedReferences.push({ externalId: item.externalId, token: link.token, targetExternalId: link.targetExternalId });
+        continue;
+      }
+      const field = link.field === "back" ? "backText" : "text";
+      const current = (field === "text" ? source.text : source.backText) ?? (await toRichText(plugin, ""));
+      const currentText = await richTextToString(plugin, current);
+      if (countOccurrences(currentText, link.token) !== 1) {
+        unresolvedReferences.push({ externalId: item.externalId, token: link.token, targetExternalId: link.targetExternalId });
+        continue;
+      }
+      const reference = await plugin.richText.rem(target).value();
+      const next = await replaceRawLinkRichText(plugin, current, link.token, reference);
+      if (field === "text") await source.setText(next);
+      else await source.setBackText(next);
+    }
+  }
+  await checkpoint(`Synced ${completed}/${total} Atlas items`);
+  return { batchId, status: "completed", created, updated, unchanged, errors: [], unresolvedReferences, indexEntries };
+}
+
+type ProgressFn = (completed: number, total: number, message?: string, checkpoint?: Array<Record<string, unknown>>) => void;
 
 function publicError(error: unknown): Record<string, unknown> {
   return {
@@ -1904,6 +2164,8 @@ export async function executeAction(
       return createFlashcard(plugin, params);
     case "createFlashcards":
       return createFlashcards(plugin, params, progress);
+    case "syncAtlasBatch":
+      return syncAtlasBatch(plugin, params, progress);
     case "updateFlashcard": {
       const rem = await requireAccessibleRem(plugin, str(params.remId) ?? str(params.noteId) ?? str(params.id), "Flashcard Rem");
       await assertPreparedTargets([rem], params);
@@ -1921,6 +2183,28 @@ export async function executeAction(
     case "searchFlashcards": {
       const rems = await findFlashcardRems(plugin, str(params.query));
       return params.verbose === true ? Promise.all(rems.map((rem) => summarizeRem(plugin, rem))) : compactRems(rems);
+    }
+    case "recentReviews": {
+      const since = Number(params.since);
+      const limit = Math.min(Math.max(1, Number(params.limit ?? 250)), 1000);
+      const reviewed = (await plugin.card.getAll())
+        .filter((card) => typeof card.lastRepetitionTime === "number" && card.lastRepetitionTime >= since)
+        .sort((a, b) => Number(b.lastRepetitionTime) - Number(a.lastRepetitionTime));
+      const selected = reviewed.slice(0, limit);
+      const items = await mapBounded(selected, 24, async (card) => {
+        const rem = await plugin.rem.findOne(card.remId);
+        if (!rem) return undefined;
+        return {
+          card: await summarizeCard(card),
+          rem: await summarizeRem(plugin, rem),
+        };
+      });
+      return {
+        since,
+        count: reviewed.length,
+        truncated: reviewed.length > limit,
+        items: items.filter(Boolean),
+      };
     }
     case "searchGraph":
     case "searchRem": {

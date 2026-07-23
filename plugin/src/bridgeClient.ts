@@ -1,11 +1,11 @@
-import type { ReactRNPlugin } from "@remnote/plugin-sdk";
+import type { ReactRNPlugin, WidgetLocation } from "@remnote/plugin-sdk";
 import { BUILD_HASH, DEFAULT_BRIDGE_URL, PLUGIN_VERSION } from "@remnoteconnect/shared";
 import { capabilityMatrix, executeAction } from "./executor.js";
 import { PluginActionError } from "./errors.js";
+import { storePairingCode, TOKEN_STORAGE_KEY } from "./pairing.js";
 
 const DAEMON_URL_SETTING = "daemonUrl";
 const TOKEN_SETTING = "daemonToken";
-const TOKEN_STORAGE_KEY = "remnoteconnect.daemonToken";
 
 const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {};
 const ENV_DAEMON_URL = env.VITE_REMNOTE_CONNECT_DAEMON_URL;
@@ -28,6 +28,7 @@ export class BridgeClient {
   private heartbeatTimer?: number;
   private reconnectDelayMs = 500;
   private bridgeGeneration?: number;
+  private missingTokenToastShown = false;
   private health: HealthState = {
     connected: false,
     tokenPresent: false,
@@ -36,6 +37,39 @@ export class BridgeClient {
   };
 
   constructor(private readonly plugin: ReactRNPlugin) {}
+
+  async registerControls(): Promise<void> {
+    const openPairing = async () => {
+      try {
+        await this.plugin.widget.openPopup("pair", undefined, false);
+        return;
+      } catch {
+        const code = window.prompt?.("Paste the short-lived RemNoteConnect code beginning with pair-:");
+        if (!code) return;
+        try {
+          storePairingCode(window.localStorage, code);
+          await this.plugin.app.toast("Pairing code saved. RemNoteConnect is completing the local handshake.");
+        } catch (error) {
+          await this.plugin.app.toast(error instanceof Error ? error.message : String(error));
+        }
+      }
+    };
+    const command = {
+      id: "remnoteconnect.pair",
+      name: "RemNoteConnect: Pair with local daemon",
+      description: "Open the local pairing-code form and connect this plugin to the RemNoteConnect daemon.",
+      keywords: "remnote connect local daemon pair bridge",
+      action: openPairing,
+    };
+    await this.plugin.app.registerCommand(command);
+    try {
+      await this.plugin.app.registerWidget("pair", "Popup" as WidgetLocation, {
+        dimensions: { width: 440, height: 360 },
+      });
+    } catch {
+      // The command falls back to a native prompt when popup widgets are unavailable.
+    }
+  }
 
   async registerSettings(): Promise<void> {
     await this.plugin.settings.registerStringSetting({
@@ -55,7 +89,14 @@ export class BridgeClient {
   async start(): Promise<void> {
     this.stopped = false;
     this.renderHealth();
-    await this.connect();
+    try {
+      await this.connect();
+    } catch (error) {
+      this.health.connected = false;
+      this.health.lastError = `Bridge startup failed: ${error instanceof Error ? error.message : String(error)}`;
+      this.renderHealth();
+      this.scheduleReconnect();
+    }
   }
 
   stop(): void {
@@ -71,10 +112,10 @@ export class BridgeClient {
   private async connect(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) return;
     this.clearReconnectTimer();
-    const url = (await this.plugin.settings.getSetting<string>(DAEMON_URL_SETTING)) || ENV_DAEMON_URL || DEFAULT_BRIDGE_URL;
+    const url = (await this.readSetting<string>(DAEMON_URL_SETTING)) || ENV_DAEMON_URL || DEFAULT_BRIDGE_URL;
     const storage = window.localStorage as Storage | undefined;
     const storedToken = typeof storage?.getItem === "function" ? storage.getItem(TOKEN_STORAGE_KEY) || "" : "";
-    const token = storedToken || (await this.plugin.settings.getSetting<string>(TOKEN_SETTING)) || "";
+    const token = storedToken || (await this.readSetting<string>(TOKEN_SETTING)) || "";
     this.health.tokenPresent = Boolean(token);
     this.health.lastError = undefined;
     this.renderHealth();
@@ -82,10 +123,14 @@ export class BridgeClient {
       this.health.connected = false;
       this.health.lastError = "Daemon token missing.";
       this.renderHealth();
-      await this.plugin.app.toast("RemNoteConnect token is missing. Paste the daemon token in plugin settings.");
+      if (!this.missingTokenToastShown) {
+        this.missingTokenToastShown = true;
+        await this.plugin.app.toast("RemNoteConnect is not paired. Run “RemNoteConnect: Pair with local daemon” from the Omnibar.");
+      }
       this.scheduleReconnect();
       return;
     }
+    this.missingTokenToastShown = false;
 
     const socket = new WebSocket(url);
     this.socket = socket;
@@ -121,6 +166,14 @@ export class BridgeClient {
       this.scheduleReconnect();
     });
     socket.addEventListener("error", () => this.handleSocketFailure(socket));
+  }
+
+  private async readSetting<T>(settingId: string): Promise<T | undefined> {
+    try {
+      return await this.plugin.settings.getSetting<T>(settingId);
+    } catch {
+      return undefined;
+    }
   }
 
   private clearReconnectTimer(): void {
@@ -215,7 +268,7 @@ export class BridgeClient {
     this.health.activeJobs += 1;
     this.renderHealth();
     try {
-      const result = await executeAction(this.plugin, message.action, message.params ?? {}, (completed, total, progressMessage) => {
+      const result = await executeAction(this.plugin, message.action, message.params ?? {}, (completed, total, progressMessage, checkpoint) => {
         if (this.socket === responseSocket && this.bridgeGeneration === responseGeneration) responseSocket.send(
           JSON.stringify({
             type: "progress",
@@ -224,6 +277,7 @@ export class BridgeClient {
             completed,
             total,
             message: progressMessage,
+            checkpoint,
           }),
         );
       });
@@ -266,6 +320,7 @@ export class BridgeClient {
   }
 
   private renderHealth(): void {
+    if (typeof document === "undefined") return;
     const root = document.getElementById("root");
     if (!root) return;
     const buildMatches = this.health.daemonBuildHash ? this.health.daemonBuildHash === BUILD_HASH : undefined;
@@ -304,7 +359,7 @@ export class BridgeClient {
         </dl>
         ${
           this.health.lastError
-            ? `<p class="rnc-error">${escapeHtml(this.health.lastError)}</p>`
+            ? `<p class="rnc-error">${escapeHtml(this.health.lastError)}</p><p class="rnc-note">Use the Omnibar command “RemNoteConnect: Pair with local daemon” to connect.</p>`
             : `<p class="rnc-note">Daemon ${escapeHtml(this.health.daemonVersion ?? "unknown")} · ${escapeHtml(this.health.daemonBuildHash ?? "no daemon build yet")}</p>`
         }
       </main>

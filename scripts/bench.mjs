@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { call, cleanupByText } from "./live-helpers.mjs";
+import { disposableTag } from "./live-fixture-names.mjs";
 
 const runId = `__rnc_bench__-${Date.now().toString(36)}`;
 const requestedCount = Number(process.env.REMNOTE_CONNECT_BENCH_COUNT ?? process.argv[2] ?? 200);
@@ -19,7 +20,7 @@ try {
   const cards = Array.from({ length: count }, (_, index) => ({
     front: `Bench front ${runId} ${index}`,
     back: `Bench back ${index}`,
-    tags: ["rnc-bench"],
+    tags: [disposableTag("rnc-bench", runId)],
     batchId: runId,
   }));
 

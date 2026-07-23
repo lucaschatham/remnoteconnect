@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     host: "127.0.0.1",
-    port: 8080,
+    port: 8081,
     strictPort: true,
     cors: {
       origin: [/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/],

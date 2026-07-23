@@ -45,6 +45,19 @@ check(
   "jobStatus and jobWait must not start queued work.",
 );
 check(
+  "atlas-explicit-gates",
+  durableJobs.includes('action === "syncAtlasBatch"') &&
+    durableJobs.includes("params.confirm !== true") &&
+    durableJobs.includes("confirmCount") &&
+    durableJobs.includes("fastLocalRootId"),
+  "experimental Atlas sync must remain root-pinned, preview-first, and exact-count guarded.",
+);
+check(
+  "atlas-no-false-undo-claim",
+  /syncAtlasBatch:\s*action\(\{[\s\S]{0,500}reversible:\s*false/.test(shared),
+  "Atlas sync must not claim daemon undo support until write-ahead restoration exists.",
+);
+check(
   "scheduler-disabled",
   executor.includes('case "answerCard"') && executor.includes('case "deleteFlashcards"') && !executor.includes("await card.remove()"),
   "scheduler mutation and generated-card removal must remain disabled until reversible and live-verified.",

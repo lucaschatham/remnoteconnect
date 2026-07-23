@@ -1,12 +1,12 @@
 {
-  "id": "remnoteconnect-local-v3",
-  "name": "RemNoteConnect Local Bridge",
+  "id": "remnoteconnect-local-dev",
+  "name": "RemNoteConnect Local Bridge (Local)",
   "author": "Lucas Chatham",
   "description": "Local bridge that lets terminal tools read, author, and safely operate on RemNote through reversible local controls.",
   "repoUrl": "https://github.com/lucaschatham/remnoteconnect",
   "version": {
     "major": 0,
-    "minor": 4,
+    "minor": 5,
     "patch": 0
   },
   "manifestVersion": 1,

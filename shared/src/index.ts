@@ -1,15 +1,54 @@
 import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1;
-export const REMNOTE_CONNECT_VERSION = "0.4.0";
+export const REMNOTE_CONNECT_VERSION = "0.5.0";
 export const DAEMON_VERSION = REMNOTE_CONNECT_VERSION;
 export const PLUGIN_VERSION = REMNOTE_CONNECT_VERSION;
-export const BUILD_HASH = "public-v0.4.0";
+export const BUILD_HASH = "__REMNOTE_CONNECT_BUILD_HASH__";
+export const IRREVERSIBLE_RECONFIRM_PHRASE = "I understand irreversible RemNote operations cannot be undone";
 export const DEFAULT_DAEMON_HOST = "127.0.0.1";
 export const DEFAULT_DAEMON_PORT = 8766;
 export const DEFAULT_DAEMON_URL = `http://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}`;
 export const DEFAULT_BRIDGE_URL = `ws://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}/bridge`;
 export const MANAGED_ROOT_NAME = "RemNoteConnect";
+export const ATLAS_METADATA_POWERUP_CODE = "remnoteconnect-local-v3";
+export const ATLAS_SYNC_CHUNK_SIZE = 25;
+export const ATLAS_MAX_ITEMS = 5_000;
+export const ATLAS_MAX_ITEM_TEXT_CHARS = 1_000_000;
+
+export type AtlasLink = {
+  token: string;
+  targetExternalId: string;
+  field?: "text" | "back";
+};
+
+export type AtlasDocument = {
+  externalId: string;
+  contentHash: string;
+  parentExternalId?: string;
+  markdown: string;
+  links?: AtlasLink[];
+};
+
+export type AtlasFlashcard = {
+  externalId: string;
+  contentHash: string;
+  parentExternalId?: string;
+  front: string;
+  back: string;
+  tags?: string[];
+  practiceDirection?: "forward" | "backward" | "both" | "none";
+};
+
+export type AtlasIndexEntry = {
+  externalId: string;
+  remId: string;
+  parentRemId?: string;
+  contentHash?: string;
+  namespace?: string;
+  lastBatchId?: string;
+  kind?: "document" | "flashcard";
+};
 
 export const ApiEnvelopeSchema = z.object({
   action: z.string().min(1),
@@ -100,6 +139,7 @@ export const PluginProgressSchema = z.object({
   completed: z.number().nonnegative(),
   total: z.number().nonnegative(),
   message: z.string().optional(),
+  checkpoint: z.array(z.record(z.string(), z.unknown())).optional(),
 });
 
 export type PluginProgress = z.infer<typeof PluginProgressSchema>;
@@ -203,7 +243,7 @@ function action(meta: ActionMetadataInput): ActionMetadata {
     effect,
     dryRunBehavior,
     undoStrategy,
-    durableJobAllowed: meta.name === "createFlashcardsAsync" || meta.name === "importAsync",
+    durableJobAllowed: meta.name === "createFlashcardsAsync" || meta.name === "importAsync" || meta.name === "syncAtlasBatch",
     schedulerCapability: meta.name === "answerCard" || meta.name === "deleteFlashcards" ? "disabled" : "none",
   };
 }
@@ -803,6 +843,21 @@ export const actionMetadata = {
     handler: "plugin",
     implemented: true,
   }),
+  recentReviews: action({
+    name: "recentReviews",
+    summary: "Read card review activity since a timestamp.",
+    mutates: false,
+    reversible: true,
+    irreversible: false,
+    bulk: true,
+    retryable: true,
+    requiresDryRunHash: false,
+    magnitudeGuarded: false,
+    minimalReturn: "{count,items}",
+    cliName: "recent-reviews",
+    handler: "plugin",
+    implemented: true,
+  }),
   searchRem: action({
     name: "searchRem",
     summary: "Legacy alias for searchGraph with summaries.",
@@ -1293,6 +1348,21 @@ export const actionMetadata = {
     handler: "daemon",
     implemented: true,
   }),
+  syncAtlasBatch: action({
+    name: "syncAtlasBatch",
+    summary: "Experimentally synchronize a pinned active Atlas subset through one local bridge job.",
+    mutates: true,
+    reversible: false,
+    irreversible: false,
+    bulk: true,
+    retryable: false,
+    requiresDryRunHash: false,
+    magnitudeGuarded: true,
+    minimalReturn: "{jobId,status,created,updated,unchanged}",
+    cliName: "sync-atlas",
+    handler: "plugin",
+    implemented: true,
+  }),
   jobWait: action({
     name: "jobWait",
     summary: "Wait for a durable job to complete or error.",
@@ -1420,6 +1490,7 @@ export const nativeActions = [
   "deleteFlashcards",
   "getFlashcard",
   "searchFlashcards",
+  "recentReviews",
   "searchRem",
   "findByTag",
   "auditManagedRoot",
@@ -1446,6 +1517,7 @@ export const nativeActions = [
   "bulkMove",
   "createFlashcardsAsync",
   "importAsync",
+  "syncAtlasBatch",
   "jobWait",
   "confirmMaterialized",
 ] as const;
@@ -1580,6 +1652,63 @@ const FlashcardWriteSchema = z.looseObject({
   verbose: z.boolean().optional(),
 });
 
+const AtlasExternalIdSchema = z.string().min(1).max(512);
+const AtlasContentHashSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/i, "contentHash must be sha256:<64 hex characters>.");
+const AtlasLinkSchema = z.object({
+  token: z.string().min(1).max(1_024),
+  targetExternalId: AtlasExternalIdSchema,
+  field: z.enum(["text", "back"]).optional(),
+});
+const AtlasDocumentSchema = z.object({
+  externalId: AtlasExternalIdSchema,
+  contentHash: AtlasContentHashSchema,
+  parentExternalId: AtlasExternalIdSchema.optional(),
+  markdown: z.string().max(ATLAS_MAX_ITEM_TEXT_CHARS),
+  links: z.array(AtlasLinkSchema).max(10_000).optional(),
+});
+const AtlasFlashcardSchema = z.object({
+  externalId: AtlasExternalIdSchema,
+  contentHash: AtlasContentHashSchema,
+  parentExternalId: AtlasExternalIdSchema.optional(),
+  front: z.string().max(ATLAS_MAX_ITEM_TEXT_CHARS),
+  back: z.string().max(ATLAS_MAX_ITEM_TEXT_CHARS),
+  tags: z.array(z.string().min(1).max(256)).max(100).optional(),
+  practiceDirection: z.enum(["forward", "backward", "both", "none"]).optional(),
+});
+const AtlasIndexEntrySchema = z.object({
+  externalId: AtlasExternalIdSchema,
+  remId: z.string().min(1),
+  parentRemId: z.string().min(1).optional(),
+  contentHash: AtlasContentHashSchema.optional(),
+  namespace: z.string().min(1).max(128).optional(),
+  lastBatchId: z.string().min(1).max(256).optional(),
+  kind: z.enum(["document", "flashcard"]).optional(),
+});
+const AtlasBatchSchema = z.object({
+  mode: z.literal("fast-local"),
+  batchId: z.string().min(1).max(256),
+  rootId: z.string().min(1),
+  namespace: z.string().min(1).max(128).default("learning-atlas"),
+  sourceRevision: z.string().min(1).max(512),
+  documents: z.array(AtlasDocumentSchema).max(ATLAS_MAX_ITEMS),
+  flashcards: z.array(AtlasFlashcardSchema).max(ATLAS_MAX_ITEMS),
+  reconcile: z.boolean().optional(),
+  confirm: z.boolean().optional(),
+  confirmCount: z.number().int().nonnegative().optional(),
+}).superRefine((batch, context) => {
+  const count = batch.documents.length + batch.flashcards.length;
+  if (count > ATLAS_MAX_ITEMS) {
+    context.addIssue({
+      code: "too_big",
+      maximum: ATLAS_MAX_ITEMS,
+      origin: "array",
+      inclusive: true,
+      path: [],
+      message: `Atlas batches are limited to ${ATLAS_MAX_ITEMS} active-subset items.`,
+    });
+  }
+});
+
 Object.assign(ACTION_PARAM_SCHEMAS, {
   version: EmptyParamsSchema,
   status: EmptyParamsSchema,
@@ -1606,11 +1735,16 @@ Object.assign(ACTION_PARAM_SCHEMAS, {
   createFlashcards: z.looseObject({ cards: z.array(z.record(z.string(), z.unknown())), deckPath: z.string().optional(), batchId: z.string().optional(), throttleMs: z.number().nonnegative().optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional(), confirmCount: z.number().int().nonnegative().optional(), verbose: z.boolean().optional() }),
   createFlashcardsAsync: z.looseObject({ cards: z.array(z.record(z.string(), z.unknown())), deckPath: z.string().optional(), batchId: z.string().optional(), throttleMs: z.number().nonnegative().optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional(), confirmCount: z.number().int().nonnegative().optional() }),
   importAsync: z.looseObject({ cards: z.array(z.record(z.string(), z.unknown())).optional(), notes: z.array(z.record(z.string(), z.unknown())).optional(), markdown: z.string().optional(), md: z.string().optional(), parentPath: z.string().optional(), externalId: z.string().optional(), batchId: z.string().optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional(), confirmCount: z.number().int().nonnegative().optional() }),
+  syncAtlasBatch: AtlasBatchSchema,
   updateFlashcard: z.looseObject({ id: z.string().min(1).optional(), remId: z.string().min(1).optional(), front: z.unknown().optional(), back: z.unknown().optional(), tags: z.array(z.string()).optional(), practiceDirection: z.enum(["forward", "backward", "none", "both"]).optional(), dryRun: z.boolean().optional() }),
   deleteFlashcards: z.looseObject({ cardId: z.string().min(1).optional(), cardIds: z.array(z.string().min(1)).optional(), dryRun: z.boolean().optional(), confirm: z.boolean().optional() }),
   searchGraph: QueryParamsSchema,
   searchRem: QueryParamsSchema,
   searchFlashcards: QueryParamsSchema,
+  recentReviews: z.looseObject({
+    since: z.number().finite().nonnegative(),
+    limit: z.number().int().positive().max(1000).optional(),
+  }),
   findNotes: QueryParamsSchema,
   findByTag: z.looseObject({ tag: z.string().min(1), verbose: z.boolean().optional() }),
   findDuplicates: z.looseObject({ by: z.enum(["text", "externalId"]).optional(), verbose: z.boolean().optional() }),

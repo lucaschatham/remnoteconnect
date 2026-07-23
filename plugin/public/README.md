@@ -17,14 +17,14 @@ This plugin requests whole-knowledge-base read/create/modify/delete permission. 
 
 The daemon binds to `127.0.0.1`, uses local pairing and bearer authentication, persists undo state before reversible writes, and requires an exact plan plus a one-time approval for irreversible operations. Even so, this is powerful local automation software, not a simple visual plugin.
 
-Scheduler mutation and structural merge are disabled in v0.4 until they can be proven reversible.
+Scheduler mutation and structural merge are disabled in v0.5 until they can be proven reversible.
 
 Do not paste daemon tokens, private notes, Rem exports, or graph maps into public issues.
 
 ## Requirements
 
 - RemNote desktop on macOS.
-- Node.js and pnpm.
+- Node.js 22 or 24 LTS and pnpm.
 - The local RemNoteConnect daemon from the public GitHub repo.
 - The daemon must be running for the plugin bridge to connect.
 

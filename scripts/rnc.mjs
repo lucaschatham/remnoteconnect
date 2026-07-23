@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
+import { probePluginBundle } from "./local-diagnostics.mjs";
 
 const DEFAULT_URL = process.env.REMNOTE_CONNECT_URL ?? "http://127.0.0.1:8766";
 const APP_DIR = process.env.REMNOTE_CONNECT_APP_DIR ?? join(homedir(), "Library", "Application Support", "RemNoteConnect");
@@ -32,6 +33,7 @@ function usage() {
   rnc get-properties ID --powerup CODE --slot SLOT
   rnc create-flashcards-async --file cards.json --confirm
   rnc import-async --md file.md --confirm
+  rnc sync-atlas --manifest atlas-batch.json --root-id REM_ROOT_ID --fast-local [--confirm] [--confirm-count N] [--wait] [--reconcile]
   rnc delete --query "text:old" [--confirm] [--confirm-count N]
   rnc find-duplicates [--by text]
   rnc find-empty
@@ -296,7 +298,19 @@ async function main() {
     const description = await call("describe", {});
     const action = args[1] ?? flags.action;
     result = action ? description.actions?.[action] ?? { error: `Unknown action: ${action}` } : description.actions;
-  } else if (command === "describe" || command === "doctor" || command === "status" || command === "metrics" || command === "init" || command === "pair") {
+  } else if (command === "doctor") {
+    result = await call(command, commonParams(flags));
+    const expectedVersion = result?.checks?.daemon?.version;
+    const pluginBundle = await probePluginBundle({
+      expectedVersion: typeof expectedVersion === "string" ? expectedVersion : undefined,
+    });
+    result = {
+      ...result,
+      ok: result?.ok === true && pluginBundle.ok,
+      checks: { ...(result?.checks ?? {}), pluginBundle },
+      warnings: [...(Array.isArray(result?.warnings) ? result.warnings : []), ...pluginBundle.warnings, ...(pluginBundle.error ? [pluginBundle.error] : [])],
+    };
+  } else if (command === "describe" || command === "status" || command === "metrics" || command === "init" || command === "pair") {
     result = await call(command, commonParams(flags));
   } else if (command === "readonly") {
     const mode = args[1] ?? flags.mode ?? "status";
@@ -370,6 +384,18 @@ async function main() {
     } else {
       usage();
     }
+  } else if (command === "sync-atlas") {
+    const manifest = flags.manifest ?? flags.file;
+    if (!manifest || !flags.rootId || flags.fastLocal !== true) usage();
+    const accepted = await call("syncAtlasBatch", {
+      ...(await readJsonPayload(manifest)),
+      mode: "fast-local",
+      rootId: flags.rootId,
+      reconcile: flags.reconcile === true,
+      confirm: flags.confirm === true,
+      confirmCount: flags.confirmCount === undefined ? undefined : Number(flags.confirmCount),
+    });
+    result = flags.wait === true ? await call("jobWait", { jobId: accepted.jobId, timeoutMs: flags.timeoutMs === undefined ? undefined : Number(flags.timeoutMs) }) : accepted;
   } else if (command === "delete") {
     result = await call(flags.query ? "bulkDelete" : "deleteRem", {
       ...commonParams(flags),
