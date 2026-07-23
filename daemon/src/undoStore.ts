@@ -1,5 +1,5 @@
 import { chmod, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 export type UndoRecord = {
   schemaVersion: 1;
@@ -17,9 +17,11 @@ export function undoDir(appDir: string): string {
 }
 
 export function undoPath(appDir: string, opId: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(opId)) throw new Error("Invalid undo opId.");
   const root = resolve(undoDir(appDir));
   const candidate = resolve(root, `${opId}.json`);
-  if (!candidate.startsWith(`${root}/`)) throw new Error("Invalid undo opId.");
+  const relativePath = relative(root, candidate);
+  if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) throw new Error("Invalid undo opId.");
   return candidate;
 }
 

@@ -606,7 +606,7 @@ describe("daemon server", () => {
     expect(JSON.stringify(rotated.json())).not.toContain(storedToken);
     expect(storedToken).toMatch(/^[0-9a-f]{64}$/);
     expect(readFileSync(bundle.config.tokenFile, "utf8").trim()).toBe(storedToken);
-    expect(statSync(bundle.config.tokenFile).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") expect(statSync(bundle.config.tokenFile).mode & 0o777).toBe(0o600);
 
     const oldToken = await bundle.app.inject({
       method: "POST",

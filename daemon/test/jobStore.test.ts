@@ -2,9 +2,23 @@ import { describe, expect, it } from "vitest";
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendJobSnapshot, compactDurableJobs, createDurableJob, jobStorePath, readDurableJob } from "../src/jobStore.js";
+import {
+  appendJobSnapshot,
+  compactDurableJobs,
+  createDurableJob,
+  isUnsupportedDirectorySyncError,
+  jobStorePath,
+  readDurableJob,
+} from "../src/jobStore.js";
 
 describe("job store", () => {
+  it("ignores only unsupported Windows directory fsync errors", () => {
+    expect(isUnsupportedDirectorySyncError({ code: "EPERM" }, "win32")).toBe(true);
+    expect(isUnsupportedDirectorySyncError({ code: "EINVAL" }, "win32")).toBe(true);
+    expect(isUnsupportedDirectorySyncError({ code: "EIO" }, "win32")).toBe(false);
+    expect(isUnsupportedDirectorySyncError({ code: "EPERM" }, "darwin")).toBe(false);
+  });
+
   it("omits repeated large params from progress snapshots and compacts finished jobs", async () => {
     const dir = mkdtempSync(join(tmpdir(), "remnote-connect-jobs-"));
     try {

@@ -27,6 +27,15 @@ export function jobStorePath(appDir: string): string {
   return join(appDir, "jobs.jsonl");
 }
 
+export function isUnsupportedDirectorySyncError(
+  error: unknown,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform !== "win32") return false;
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EPERM" || code === "EINVAL" || code === "ENOTSUP";
+}
+
 export function createDurableJob(action: DurableJobRecord["action"], params: Record<string, unknown>, total: number): DurableJobRecord {
   const now = new Date().toISOString();
   return {
@@ -154,7 +163,11 @@ export async function compactDurableJobs(appDir: string): Promise<{ jobs: number
   await rename(tmp, file);
   const directory = await open(appDir, "r");
   try {
-    await directory.sync();
+    try {
+      await directory.sync();
+    } catch (error) {
+      if (!isUnsupportedDirectorySyncError(error)) throw error;
+    }
   } finally {
     await directory.close();
   }
