@@ -1469,7 +1469,7 @@ describe("daemon server", () => {
 
     const undoPath = join(bundle.config.appDir, "undo", `${preparedOpId}.json`);
     expect(existsSync(undoPath)).toBe(true);
-    expect(statSync(undoPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") expect(statSync(undoPath).mode & 0o777).toBe(0o600);
     expect(readFileSync(undoPath, "utf8")).toContain("secret note body");
 
     const auditPath = join(bundle.config.logDir, "audit.jsonl");
