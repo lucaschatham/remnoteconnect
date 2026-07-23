@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@remnoteconnect/shared": "workspace:*",
-    "fastify": "^5.4.0",
+    "fastify": "^5.10.0",
     "ws": "^8.18.3",
     "zod": "^4.4.3"
   },
