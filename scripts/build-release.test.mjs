@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildIdentity, replaceBuildMarker } from "./build-release.mjs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { buildIdentity, releaseRoot, replaceBuildMarker } from "./build-release.mjs";
+
+test("resolves the release root through the platform-aware file URL converter", () => {
+  assert.equal(releaseRoot(import.meta.url), resolve(dirname(fileURLToPath(import.meta.url)), ".."));
+});
 
 test("derives a stable release identity from the version and full commit", () => {
   assert.equal(

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const roots = [
   "daemon/src",
@@ -15,7 +16,7 @@ const roots = [
 ];
 const files = ["package.json", "daemon/package.json", "plugin/package.json", "shared/package.json"];
 const tokenPattern = /(?<![a-fA-F0-9])[a-fA-F0-9]{64}(?![a-fA-F0-9])/;
-const rootDir = new URL("..", import.meta.url).pathname;
+const rootDir = fileURLToPath(new URL("..", import.meta.url));
 const ignoredGeneratedArtifacts = new Set([
   "docs/obsidian-census.json",
   "docs/obsidian-census.md",

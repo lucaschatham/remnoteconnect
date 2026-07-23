@@ -2,7 +2,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { resolve, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const BUILD_MARKER = "__REMNOTE_CONNECT_BUILD_HASH__";
 
@@ -15,6 +15,10 @@ export function buildIdentity(version, commit) {
 export function replaceBuildMarker(content, buildHash) {
   const count = content.split(BUILD_MARKER).length - 1;
   return { content: content.split(BUILD_MARKER).join(buildHash), count };
+}
+
+export function releaseRoot(moduleUrl = import.meta.url) {
+  return resolve(fileURLToPath(new URL("..", moduleUrl)));
 }
 
 function filesUnder(root) {
@@ -40,7 +44,7 @@ function runBuild(root) {
   }
 }
 
-export function createReleaseBuild(root = resolve(new URL("..", import.meta.url).pathname)) {
+export function createReleaseBuild(root = releaseRoot()) {
   const dirty = git(root, ["status", "--porcelain"]);
   if (dirty) {
     throw new Error("Release builds require a clean Git worktree. Commit the intended source state first.");
