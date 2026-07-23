@@ -4,7 +4,7 @@ import { probePluginBundle } from "./local-diagnostics.mjs";
 
 const manifest = {
   id: "remnoteconnect-local-dev",
-  name: "RemNoteConnect Local Bridge",
+  name: "RemNoteConnect (Local Development)",
   version: { major: 0, minor: 5, patch: 0 },
 };
 

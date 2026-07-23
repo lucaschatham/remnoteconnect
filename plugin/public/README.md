@@ -1,4 +1,4 @@
-# RemNoteConnect Local Bridge
+# RemNoteConnect
 
 RemNoteConnect is a local-first bridge for people who want to use terminal tools, scripts, and LLM agents with RemNote.
 

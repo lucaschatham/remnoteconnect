@@ -11,8 +11,9 @@
   "scripts": {
     "build": "node scripts/build-release.mjs",
     "build:packages": "pnpm -r build",
+    "package:remnote": "node scripts/package-remnote-plugin.mjs",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm --filter @remnoteconnect/plugin test && pnpm --filter @remnoteconnect/daemon test && node --test scripts/local-diagnostics.test.mjs scripts/build-release.test.mjs scripts/install-utils.test.mjs scripts/live-fixture-names.test.mjs",
+    "test": "pnpm --filter @remnoteconnect/plugin test && pnpm --filter @remnoteconnect/daemon test && node --test scripts/local-diagnostics.test.mjs scripts/build-release.test.mjs scripts/install-utils.test.mjs scripts/live-fixture-names.test.mjs scripts/package-remnote-plugin.test.mjs",
     "dev:daemon": "pnpm --filter @remnoteconnect/daemon dev",
     "dev:plugin": "pnpm --filter @remnoteconnect/plugin dev",
     "token:unsafe": "pnpm --filter @remnoteconnect/daemon token:unsafe",
@@ -40,7 +41,10 @@
     "launch-agent:check": "node scripts/install-launch-agent.mjs check",
     "launch-agent:uninstall": "node scripts/install-launch-agent.mjs uninstall",
     "check:no-token": "node scripts/check-no-token.mjs",
-    "check:redteam": "node scripts/static-redteam.mjs"
+    "check:redteam": "node scripts/static-redteam.mjs",
+    "check:anki-contract": "pnpm --filter @remnoteconnect/shared build && node scripts/check-anki-contract.mjs",
+    "check:anki-smoke": "pnpm build && node scripts/smoke-anki-listener.mjs",
+    "bench:anki-compat": "pnpm build && node scripts/bench-anki-compat.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",

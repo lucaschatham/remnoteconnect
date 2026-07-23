@@ -29,6 +29,17 @@ npm run check:redteam
 
 Both commands should return no results.
 
+## RemNote Upload Package
+
+Create a clean-source release build and the validated RemNote ZIP:
+
+```sh
+pnpm build
+pnpm package:remnote
+```
+
+The packager preserves the existing public plugin ID, verifies the public name and version, checks the Git-derived build identity, and writes `.artifacts/RemNoteConnect-vVERSION-remnote-plugin.zip`.
+
 ## Fresh Clone Smoke
 
 Clone into a temporary directory and verify:
@@ -79,3 +90,5 @@ Draft the GitHub release with:
 - install steps
 - known limitations
 - link to `docs/SAFE_USAGE.md`
+
+Attach the validated RemNote ZIP to the GitHub release. Upload the same ZIP through RemNote's Build tab so the reviewed artifact and release artifact are identical.

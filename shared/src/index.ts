@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export * from "./ankiConnect.js";
+
 export const PROTOCOL_VERSION = 1;
 export const REMNOTE_CONNECT_VERSION = "0.5.0";
 export const DAEMON_VERSION = REMNOTE_CONNECT_VERSION;
@@ -9,6 +11,7 @@ export const IRREVERSIBLE_RECONFIRM_PHRASE = "I understand irreversible RemNote 
 export const DEFAULT_DAEMON_HOST = "127.0.0.1";
 export const DEFAULT_DAEMON_PORT = 8766;
 export const DEFAULT_DAEMON_URL = `http://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}`;
+// nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- The bridge is loopback-only; local TLS would not add trust without certificate provisioning.
 export const DEFAULT_BRIDGE_URL = `ws://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}/bridge`;
 export const MANAGED_ROOT_NAME = "RemNoteConnect";
 export const ATLAS_METADATA_POWERUP_CODE = "remnoteconnect-local-v3";

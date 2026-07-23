@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0
+
+Local Atlas and AnkiConnect compatibility release.
+
+- Renamed the public plugin to RemNoteConnect while preserving the existing RemNote plugin ID for in-place updates.
+- Split public release identity from the localhost development identity so local testing cannot overwrite or duplicate the public listing.
+- Added a validated release packager that emits the exact RemNote upload ZIP from a clean, Git-identified build.
+- Added an opt-in loopback AnkiConnect v6 compatibility listener with all 122 official actions recognized, stable integer IDs, native read-only enforcement, and explicit capability errors.
+- Implemented 71 protocol, note, deck, tag, query, model-metadata, and media actions through RemNote translation or a persistent compatibility sidecar.
+- Added fast local Atlas batch synchronization with pinned-root enforcement, content hashes, parent ordering, and unchanged-item skipping.
+- Added cross-layer, hostile-input, restart, 10,000-identity, listener-startup, and occupied-port regression coverage.
+- Hardened media handling against traversal, symlink reads and overwrites, unbounded patterns, oversized downloads, and malformed base64.
+- Added a three-platform Node 22 CI matrix, immutable action pins, dependency cooldowns, and pnpm supply-chain policies.
+- Documented the exact compatibility boundary and roadmap for blocked scheduler, review-log, GUI, sync, and APKG actions.
+
 ## 0.4.0
 
 Safety and reliability release.

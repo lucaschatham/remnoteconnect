@@ -189,7 +189,7 @@ RemNoteConnect exposes a native action API:
 }
 ```
 
-It also includes an AnkiConnect-inspired adapter for familiar workflows:
+It also includes an AnkiConnect-inspired adapter on the native API for familiar workflows:
 
 - `addNote`
 - `addNotes`
@@ -200,7 +200,15 @@ It also includes an AnkiConnect-inspired adapter for familiar workflows:
 - `createDeck`
 - `changeDeck`
 
-This is workflow parity, not literal Anki compatibility. Anki-specific model, template, scheduler, and `.apkg` actions return stable unsupported errors.
+For existing AnkiConnect clients, an independent compatibility listener can be enabled on `127.0.0.1:8765`. It recognizes all 122 actions in the pinned AnkiConnect v6 contract and currently implements 71 through native translation or a local compatibility sidecar. Scheduler/review-log, Anki desktop GUI, and APKG behavior fail explicitly because RemNote exposes no faithful equivalent.
+
+```sh
+REMNOTE_CONNECT_ANKI_COMPAT=on \
+REMNOTE_CONNECT_ANKI_API_KEY='choose-a-local-secret' \
+npx pnpm@11.7.0 --filter @remnoteconnect/daemon start
+```
+
+Compatibility Mode is off by default and remains subject to native read-only mode. See [docs/ANKICONNECT_COMPATIBILITY.md](docs/ANKICONNECT_COMPATIBILITY.md) for the action status, mappings, safety rules, and setup.
 
 ## Core Actions
 
@@ -256,7 +264,7 @@ Disabled or experimental in v0.5:
 - structural merge is disabled until reference inversion is live-verified
 - pinned-root fast local Atlas sync remains opt-in until large disposable-root benchmarks pass
 - semantic search sidecars
-- RemNote marketplace packaging
+- RemNote listing review and broad distribution. Validated unlisted-plugin packaging is supported.
 - cross-platform packaging beyond local Mac usage
 
 ## Verification
