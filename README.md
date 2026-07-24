@@ -61,6 +61,15 @@ Because the CLI is plain shell, it can be used by Codex, Claude Code, Cursor age
 
 ## Architecture
 
+<picture>
+  <source media="(max-width: 600px)" srcset="docs/images/system-architecture-mobile.webp">
+  <img src="docs/images/system-architecture.webp" alt="RemNoteConnect system architecture showing terminal, scripts, and LLM agents connecting through a token-protected local API, daemon, and RemNote plugin to a RemNote knowledge graph, with approval and safety controls." width="100%">
+</picture>
+
+*RemNoteConnect keeps the bridge local and places explicit approval between tools and writes to your knowledge base.*
+
+The detailed transport path is:
+
 ```mermaid
 flowchart LR
   CLI["CLI / scripts / LLM agent"] --> Daemon["Local daemon\n127.0.0.1:8766"]
